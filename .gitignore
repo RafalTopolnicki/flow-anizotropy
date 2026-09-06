@@ -1,0 +1,24 @@
+# Datasets — structures, LBM results and the transfer tarball.
+# The GIFs cannot be regenerated bit-for-bit on a machine with a different
+# NumPy (see NOTES.md 5.4), so archive DATA/ separately rather than relying
+# on --seed to reproduce it.
+DATA/
+
+# Papers (third-party PDFs)
+papers/
+
+# Build artefacts
+LMB2d/lbm2d-perm
+LMB2d/lbm2d-perm-gl
+LMB2d/lbm2d-250x250
+LMB2d/lbm2d-256x256
+LMB2d/lbm2d-256x256_force
+*.o
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors
+.idea/
+.vscode/
