@@ -6,6 +6,10 @@ Predicting the **2D permeability anisotropy tensor** of porous images from
 Status as of 2026-09-06: solver and dataset generator are built, tested and
 validated on a 60-sample pilot. The TDA port and the models are not started.
 
+The full working session that produced all of this — including the measurements
+behind each design decision and the two bugs found along the way — is in
+`CONVERSATION.md` (readable) and `CONVERSATION.jsonl` (unabridged).
+
 ---
 
 ## 1. What this project is
@@ -266,8 +270,16 @@ directly comparable with the solver's `theta_deg`.
 with **4-connectivity** — a diagonal pinch has zero cross-section, conducts
 nothing under D2Q9 bounce-back, and would burn the solver's whole step budget.
 
-**Outputs**: `structures/*.gif` (for the solver), `npy/*.npy` (uint8, 1 = solid,
-for the TDA pipeline), `structures.csv`, `filelist.txt`, `gen.log`.
+**Outputs**: `structures/*.gif`, `structures.csv`, `filelist.txt`, `gen.log`.
+
+**One structure format, deliberately.** The GIF is what the C++ solver reads, so
+it is the only copy stored — the same bytes feed the LBM and the TDA descriptors,
+with no second file to drift out of sync. On the Python side always load it
+through `scripts/structure_io.load_structure`, which reproduces
+`LMB2d/lbm.cpp: read_from_gif` rule for rule (`red > 0` is pore, and image
+(row, col) -> `F[x][y]`, so the array is indexed `[solver_y, solver_x]` — do not
+transpose it). `python scripts/structure_io.py <dataset_dir>` checks the reader
+against the porosity the solver itself reports.
 
 > **Do not regex-parse the filenames.** `\w` matches `_`, so `str=(\w+)` on
 > `sample_000003_str=iso_A=1.00_...` silently returns `iso_A`. The same class of
@@ -332,8 +344,10 @@ solver's x; ψ=0 shrinks the x wavenumbers and ψ=90° the y ones; the field is
 continuous across the periodic wrap; and a vertical solid wall gives
 `perc_x=False, perc_y=True`. All pass.
 
-`.npy` and `.gif` verified to encode byte-identical structures, and the recorded
-porosity equals `1 − mean(npy)`.
+`scripts/structure_io.py <dataset_dir>` cross-checks the Python GIF reader
+against the porosity the **solver itself** reports (`getporosity_full()`, written
+into every row): max difference **0.000e+00** over 25 structures. That is the
+guarantee that the C++ and Python sides see the same structure.
 
 Pilot: 60 structures (20 per stratum), generated in **1 s**, solved in 21 min on
 14 cores. **60/60 converged in both directions, no failures.** Median 50k steps
@@ -411,6 +425,8 @@ Source: `~/direction-aware-tda-for-porous-materials/scripts/`. Notes from readin
 - `notes/why_ph_insensitive_to_radius.md` in the source repo applies: PH sees
   only channel 0, so `radius` is a no-op for PH — don't scan it in 2D either.
 - Baselines: profiles/TPC resample to 256 / 129 points.
+- **Load structures with `scripts/structure_io.load_structure`, not `np.load`** —
+  the 3D project stored `.npy`; here there is only the GIF, on purpose.
 - `train_catboost_directional.py` is essentially target-agnostic — only
   `TARGET_GROUPS` needs new entries.
 

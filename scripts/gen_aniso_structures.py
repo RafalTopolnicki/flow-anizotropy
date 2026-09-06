@@ -1,4 +1,4 @@
-"""
+r"""
 Generate 2D periodic porous structures with controlled flow anisotropy.
 
 Why not reuse the k0/k2 generators
@@ -47,6 +47,11 @@ directly comparable.  `--self-test` checks this end to end.
 The generator knobs (A, ψ, k0, N) are written to the summary CSV for
 stratification and confound analysis.  They are *not* model features — the
 whole point is to predict K from the image.
+
+The GIF is the *only* structure format written, deliberately: it is what the C++
+solver reads, so the same bytes feed the LBM and the TDA descriptors and there is
+no second copy to drift out of sync.  Load it in Python with
+`scripts/structure_io.load_structure`, which mirrors the solver's reader exactly.
 
 `structures.csv` (and the merged `permeability.csv`) is the source of truth for
 every per-sample quantity; the filename repeats them only for readability.  Do
@@ -190,14 +195,10 @@ def gen_one(sample_id, cfg):
 
         write_gif((1 - np.dstack([solid, solid, solid])) * 255,
                   os.path.join(cfg["structures_dir"], fname + ".gif"))
-        if cfg["save_npy"]:
-            np.save(os.path.join(cfg["npy_dir"], fname + ".npy"),
-                    solid.astype(np.uint8))
 
         return {
             "sample_id": sample_id,
             "filename": fname + ".gif",
-            "npy": fname + ".npy" if cfg["save_npy"] else "",
             "stratum": name,
             "aniso_A": aniso,
             "psi_deg": float(np.degrees(psi)),
@@ -285,8 +286,6 @@ def main():
     p.add_argument("--porosity_max", type=float, default=0.90)
     p.add_argument("--max_attempts", type=int, default=200)
     p.add_argument("--workers", type=int, default=os.cpu_count())
-    p.add_argument("--no_npy", action="store_true",
-                   help="skip the .npy copies used by the TDA pipeline")
     p.add_argument("--self-test", action="store_true", dest="selftest")
     args = p.parse_args()
 
@@ -296,10 +295,7 @@ def main():
         p.error("--output is required (or use --self-test)")
 
     structures_dir = os.path.join(args.output, "structures")
-    npy_dir = os.path.join(args.output, "npy")
     os.makedirs(structures_dir, exist_ok=True)
-    if not args.no_npy:
-        os.makedirs(npy_dir, exist_ok=True)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -309,8 +305,6 @@ def main():
 
     cfg = {
         "structures_dir": structures_dir,
-        "npy_dir": npy_dir,
-        "save_npy": not args.no_npy,
         "seed": args.seed,
         "k0_min": args.k0_min, "k0_max": args.k0_max, "dk": args.dk,
         "modes_min": args.modes_min, "modes_max": args.modes_max,
