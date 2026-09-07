@@ -3,6 +3,15 @@
 # NumPy (see NOTES.md 5.4), so archive DATA/ separately rather than relying
 # on --seed to reproduce it.
 DATA/
+DESC/
+RESULTS/
+
+# Single-structure velocity fields and ParaView files (scripts/solve_velocity.py)
+VIZ/
+
+# Session transcripts are large; keep them locally, archive separately.
+# The originals live in ~/.claude/projects/ and can be re-exported.
+conversations/*.jsonl
 
 # Papers (third-party PDFs)
 papers/
