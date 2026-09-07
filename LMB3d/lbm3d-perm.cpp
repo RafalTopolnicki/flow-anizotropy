@@ -14,20 +14,35 @@
 // sample as free error bars on the off-diagonals.  In 2D that gave one free
 // error bar; here it gives three, one per off-diagonal target.
 //
-// The convergence machinery is ported unchanged in spirit from the 2D solver,
-// where it was arrived at by measurement (NOTES.md section 3):
+// Convergence is deliberately the simplest thing that works: every --lag steps,
+// compare each component of the domain-averaged flux with its value one lag
+// earlier, and stop when all three have moved by less than eps * ||q||.
 //
-//   * the test is on *block means* of the domain-averaged flux, not on
-//     instantaneous samples.  Past the transient the residuals stop decaying
-//     and fluctuate; an instantaneous test never accumulates consecutive
-//     passes and runs to the step cap on a solution that settled long ago.
-//   * every component is tested against its own magnitude.  The transverse
-//     components are heavily cancelling sums and converge much later than the
-//     driven one, so a single scalar residual is meaningless.
-//   * the tolerance is the looser of a relative bound and k-sigma of the block
-//     mean's own standard error, which makes it self-calibrating.
-//   * --hold consecutive passes are required, then q is block-averaged over a
-//     further --avg-steps rather than read off at the stopping step.
+// The one part that is NOT negotiable is the scale.  The tolerance is relative
+// to the magnitude of the whole flux vector, not to the component being tested.
+// A per-component relative test divides by a quantity that goes to zero: under
+// axis-aligned forcing the transverse components are small by construction and
+// exactly zero for a blocked direction, so such a test can never be satisfied
+// and the run burns its whole budget on an answer that converged long ago.
+// Those small transverse components are the off-diagonals — the entire point of
+// the study.
+//
+// --hold consecutive passes are required because one is not trustworthy: NOTES
+// 3.4 measured a 2D residual reading 7e-6 at step 30000 and 3.5e-3 at 35000.
+// That is one extra comparison, not a mechanism.
+//
+// The 2D solver carries considerably more than this — block means rather than
+// instantaneous samples, a k-sigma statistical tolerance, a separate relative
+// floor.  Every piece of it was forced by a measured 2D failure (NOTES 3.2-3.5)
+// and every one of those failures traces to `float` distributions, which make
+// BGK carry a persistent roundoff fluctuation so that "past the transient you
+// are not converging, you are sampling a stationary fluctuation".  In double
+// the solver reaches a genuine fixed point — measured: block means bit-identical
+// across three consecutive windows, averaging-phase standard error exactly 0.0 —
+// so none of that machinery has anything to do here.  It was ported once as
+// insurance and then removed on the evidence.  If a structure does fluctuate it
+// will fail to converge and be flagged by conv_*, which is the safe direction to
+// fail in.
 //
 // Two deliberate departures from the 2D code, neither of which has a legacy
 // dataset to stay compatible with:
@@ -102,16 +117,13 @@ static const double FX_BASE = 2.5e-07;             // body force at force factor
 // --- configuration ---------------------------------------------------------
 struct Config
 {
-    double ff         = 1.0;
-    double eps        = 1e-3;
-    long   lag        = 2000;
-    int    hold       = 3;
-    long   min_steps  = 4000;
-    long   max_steps  = 200000;
-    long   avg_steps  = 8000;
-    long   avg_sample = 25;
-    double qfloor     = 1e-2;
-    double ksigma     = 3.0;
+    double ff        = 1.0;
+    double eps       = 1e-5;   // drift tolerance, relative to ||q||
+    long   lag       = 2000;
+    int    hold      = 2;
+    long   min_steps = 4000;
+    long   max_steps = 200000;
+    long   avg_steps = 2000;
     string velocity_prefix;
     bool   quiet      = false;
     bool   validate   = false;
@@ -295,60 +307,38 @@ static Solve solve(double fx, double fy, double fz, const Config &cfg, const cha
     reset_distributions();
     Fx = fx; Fy = fy; Fz = fz;
 
-    long s = 0;
-    int  hold = 0;
-    bool have_prev = false;
-    double pm[3] = {0,0,0}, pse[3] = {0,0,0};
-    double bs[3] = {0,0,0}, bss[3] = {0,0,0};
-    long   bn = 0;
+    long   s = 0;
+    int    hold = 0;
+    bool   have_prev = false;
+    double qprev[3] = {0, 0, 0};
 
+    // --- phase 1: run until the flux stops changing ------------------------
     while(s < cfg.max_steps)
     {
         lbm_step(); s++;
+        if(s % cfg.lag) continue;
 
-        if(s % cfg.avg_sample == 0)
-        {
-            double q[3]; volumeavg(q);
-            for(int c = 0; c < 3; c++)
-            {
-                if(!std::isfinite(q[c]))
-                    die(string("non-finite flux in run ") + tag + " at step " + to_string(s));
-                bs[c] += q[c]; bss[c] += q[c]*q[c];
-            }
-            bn++;
-        }
-
-        if(s % cfg.lag || bn < 2) continue;
-
-        double m[3], se[3];
+        double q[3];
+        volumeavg(q);
         for(int c = 0; c < 3; c++)
-        {
-            m[c]  = bs[c]/bn;
-            double var = (bss[c] - bn*m[c]*m[c]) / (bn - 1);
-            se[c] = sqrt(max(var, 0.0)/bn);
-        }
+            if(!std::isfinite(q[c]))
+                die(string("non-finite flux in run ") + tag + " at step " + to_string(s));
 
-        if(have_prev)
-        {
-            const double qmag = sqrt(m[0]*m[0] + m[1]*m[1] + m[2]*m[2]);
-            const double flo  = cfg.qfloor * qmag;
-            bool pass = true;
-            for(int c = 0; c < 3; c++)
-            {
-                const double d   = fabs(m[c] - pm[c]);
-                const double tol = max(cfg.eps * max(fabs(m[c]), flo),
-                                       cfg.ksigma * sqrt(se[c]*se[c] + pse[c]*pse[c]));
-                if(d >= tol) pass = false;
-            }
-            if(s >= cfg.min_steps && pass) hold++; else hold = 0;
-        }
+        const double norm = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2]);
+        double drift = 0.0;
+        for(int c = 0; c < 3; c++) drift = max(drift, fabs(q[c] - qprev[c]));
+
+        if(have_prev && s >= cfg.min_steps && drift < cfg.eps * norm) hold++;
+        else                                                          hold = 0;
 
         if(!cfg.quiet)
-            cout << "# " << tag << " " << s << "  q=(" << m[0] << ", " << m[1]
-                 << ", " << m[2] << ")  hold=" << hold << endl;
+            cout << "# " << tag << " " << s << "  q=(" << q[0] << ", " << q[1]
+                 << ", " << q[2] << ")  drift/tol="
+                 << (norm > 0 ? drift / (cfg.eps * norm) : 0.0)
+                 << "  hold=" << hold << endl;
 
-        for(int c = 0; c < 3; c++) { pm[c] = m[c]; pse[c] = se[c]; bs[c] = bss[c] = 0.0; }
-        bn = 0; have_prev = true;
+        for(int c = 0; c < 3; c++) qprev[c] = q[c];
+        have_prev = true;
 
         if(hold >= cfg.hold) break;
     }
@@ -357,31 +347,32 @@ static Solve solve(double fx, double fy, double fz, const Config &cfg, const cha
     if(!out.converged && !cfg.quiet)
         cerr << "# " << tag << ": max-steps reached without convergence" << endl;
 
-    // --- averaging phase ---------------------------------------------------
-    double as[3] = {0,0,0}, ass[3] = {0,0,0};
+    // --- phase 2: average, and report the spread ---------------------------
+    // Kept not for accuracy — in double there is no fluctuation left to average
+    // — but because se_* is the measurement that says so, per sample.  If it
+    // ever comes back non-zero, this run needed it and we want to know.
+    double sum[3] = {0,0,0}, sumsq[3] = {0,0,0};
     long   n = 0;
-    for(long t = 1; t <= cfg.avg_steps; t++)
+    for(long i = 0; i < cfg.avg_steps; i++)
     {
         lbm_step(); s++;
-        if(t % cfg.avg_sample) continue;
         double q[3]; volumeavg(q);
-        for(int c = 0; c < 3; c++) { as[c] += q[c]; ass[c] += q[c]*q[c]; }
+        for(int c = 0; c < 3; c++) { sum[c] += q[c]; sumsq[c] += q[c]*q[c]; }
         n++;
     }
 
-    if(n == 0) { volumeavg(out.q); }
+    if(n == 0) volumeavg(out.q);
     else
-    {
         for(int c = 0; c < 3; c++)
         {
-            out.q[c] = as[c]/n;
+            out.q[c] = sum[c] / n;
             if(n > 1)
             {
-                double var = (ass[c] - n*out.q[c]*out.q[c]) / (n - 1);
-                out.se[c] = sqrt(max(var, 0.0)/n);
+                const double var = (sumsq[c] - n*out.q[c]*out.q[c]) / (n - 1);
+                out.se[c] = sqrt(max(var, 0.0) / n);
             }
         }
-    }
+
     out.steps = s;
 
     if(!cfg.velocity_prefix.empty())
@@ -445,16 +436,12 @@ static void usage()
 "appends one row with the full 3x3 permeability tensor to <results.csv>.\n"
 "\n"
 "  --ff F            force factor; body force = 2.5e-07 * F   (default 1)\n"
-"  --eps E           per-component relative tolerance         (default 1e-3)\n"
+"  --eps E           drift tolerance, relative to |q|         (default 1e-5)\n"
 "  --lag N           steps between convergence checks         (default 2000)\n"
-"  --hold K          consecutive passing checks required      (default 3)\n"
+"  --hold K          consecutive passing checks required      (default 2)\n"
 "  --min-steps N     no convergence before this step          (default 4000)\n"
 "  --max-steps N     give up after this many steps            (default 200000)\n"
-"  --avg-steps N     length of the averaging phase            (default 8000)\n"
-"  --avg-sample N    flux sampling interval                   (default 25)\n"
-"  --qfloor R        floor for the relative test              (default 1e-2)\n"
-"  --ksigma K        accept a change within K sigma of the block mean's\n"
-"                    own standard error                       (default 3)\n"
+"  --avg-steps N     averaging phase after convergence        (default 2000)\n"
 "  --velocity PREFIX write PREFIX.fx.vel, PREFIX.fy.vel, PREFIX.fz.vel\n"
 "  --validate        extra solve along (1,1,1)/sqrt(3); reports the flux\n"
 "                    predicted by K against the measured one (Koza09 test)\n"
@@ -491,9 +478,6 @@ int main(int argc, char **argv)
         else if(a == "--min-steps")  cfg.min_steps  = need_long(argc, argv, i);
         else if(a == "--max-steps")  cfg.max_steps  = need_long(argc, argv, i);
         else if(a == "--avg-steps")  cfg.avg_steps  = need_long(argc, argv, i);
-        else if(a == "--avg-sample") cfg.avg_sample = need_long(argc, argv, i);
-        else if(a == "--qfloor")     cfg.qfloor     = need_double(argc, argv, i);
-        else if(a == "--ksigma")     cfg.ksigma     = need_double(argc, argv, i);
         else if(a == "--velocity")
         {
             if(i + 1 >= argc) { usage(); die("missing value for --velocity"); }
