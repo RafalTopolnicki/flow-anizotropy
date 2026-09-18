@@ -57,6 +57,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from structure_io import load_structure                      # noqa: E402
 from train_catboost import TARGET_GROUPS, resolve_targets, koff_noise_ceiling  # noqa: E402
+from metrics import fold_metrics, summarize, fmt, write_metrics_json  # noqa: E402
 
 
 # --- how each target behaves under the dihedral group ----------------------
@@ -268,8 +269,9 @@ def main():
     if not os.path.exists(labels):
         raise SystemExit(f"no labels at {labels} — has the LBM run finished?")
     df = pd.read_csv(labels)
-    if {"conv_fx", "conv_fy"} <= set(df.columns):
-        df = df[(df.conv_fx == 1) & (df.conv_fy == 1)]
+    conv = [c for c in ("conv_fx", "conv_fy", "conv_fz") if c in df.columns]
+    if conv:
+        df = df[(df[conv] == 1).all(axis=1)]
     if a.strata:
         df = df[df.stratum.isin(a.strata)]
     if a.limit:
@@ -296,30 +298,46 @@ def main():
 
     cv = KFold(a.folds, shuffle=True, random_state=a.seed)
     oof = np.full_like(Y, np.nan)
+    test_idx = []                       # kept so R2 can be scored per fold
     for f, (tr, te) in enumerate(cv.split(X)):
         if a.only_fold >= 0 and f != a.only_fold:
             continue
         t0 = time.time()
         oof[te] = run_fold(X, Y, tr, te, a, targets)
+        test_idx.append(te)
         print(f"  fold {f}: {time.time() - t0:.0f} s")
 
-    done = np.isfinite(oof).all(1)
-    rows = []
-    for i, t in enumerate(targets):
-        yt, yp = Y[done, i], oof[done, i]
-        ss = ((yt - yt.mean()) ** 2).sum()
+    # Score per fold and report the mean, matching train_catboost.py exactly —
+    # both go through scripts/metrics.py so the two cannot drift apart again.
+    # Scoring the pooled out-of-fold vector instead gives a *different
+    # statistic*: one R2 against the global mean rather than the average of
+    # per-fold R2 each against its own fold's mean, and it carries no spread, so
+    # a CNN row could not be compared like for like against a CatBoost row.
+    rows, per_fold = [], []
+    for i, t_name in enumerate(targets):
+        folds = [fold_metrics(Y[te, i], oof[te, i], fold=f_i)
+                 for f_i, te in enumerate(test_idx)]
+        summ = summarize(folds)
+        n_done = int(np.isfinite(oof[:, i]).sum())
         rows.append({"group": f"cnn_{a.backbone}", "n_features": 256 * 256,
-                     "target": t,
+                     "target": t_name,
                      "mode": "joint" if len(targets) > 1 else "single",
-                     "r2_mean": float(1 - ((yt - yp) ** 2).sum() / ss) if ss > 0 else np.nan,
-                     "r2_std": np.nan,
-                     "mae_mean": float(np.abs(yt - yp).mean()),
-                     "n": int(done.sum())})
-        print(f"  {t:14s} R2 {rows[-1]['r2_mean']:7.4f}   MAE {rows[-1]['mae_mean']:.4g}")
+                     **summ, "n": n_done})
+        per_fold.append({"group": f"cnn_{a.backbone}", "target": t_name,
+                         "mode": "joint" if len(targets) > 1 else "single",
+                         "n_features": 256 * 256, "n": n_done,
+                         "folds": folds, **summ})
+        print(f"  {t_name:14s} {fmt(summ)}")
 
     os.makedirs(a.output, exist_ok=True)
     pd.DataFrame(rows).to_csv(os.path.join(a.output, "results.csv"), index=False)
     np.save(os.path.join(a.output, "oof_predictions.npy"), oof)
+    write_metrics_json(a.output,
+                       {"kind": "cnn", "backbone": a.backbone, "folds": a.folds,
+                        "seed": a.seed, "epochs": a.epochs, "batch": a.batch,
+                        "augment": a.augment, "n_rows": len(df),
+                        "koff_ceiling": ceiling},
+                       per_fold)
     with open(os.path.join(a.output, "arguments.json"), "w") as fh:
         json.dump({**vars(a), "targets": targets, "n_rows": len(df),
                    "koff_ceiling": ceiling}, fh, indent=2)

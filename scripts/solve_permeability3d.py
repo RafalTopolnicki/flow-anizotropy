@@ -38,14 +38,20 @@ values k1 >= k2 >= k3 and the fractional anisotropy are safe; the axes are not.
 """
 
 import argparse
+import hashlib
+import json
 import os
 import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from metrics import koff_ceilings3d                              # noqa: E402
 
 DEFAULT_SOLVER = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "LMB3d", "lbm3d-perm")
@@ -157,16 +163,67 @@ def main():
         out[f"koff_rel_err_{a}{b}"] = asym / (2 * sym).abs()
         out[f"koff_over_trace_{a}{b}"] = sym.abs() / trace.abs()
 
+    # Scale-free deviator of the symmetrised tensor: (Ks - k_mean I) / k_mean.
+    # Five independent components -- dev_zz is -(dev_xx + dev_yy) -- so
+    # log_k_mean plus these five is the whole tensor with scale and shape
+    # separated, which is the target set the docstring above argues for.
+    km = out["k_mean"].where(out["k_mean"] > 0)
+    out["dev_xx"] = out["K_xx"] / km - 1.0
+    out["dev_yy"] = out["K_yy"] / km - 1.0
+    for a, b in (("x", "y"), ("x", "z"), ("y", "z")):
+        out[f"dev_{a}{b}"] = out[f"k_{a}{b}"] / km
+
+    out = out.sort_values("sample_id").reset_index(drop=True)
+    out["conv_all"] = ((out.conv_fx == 1) & (out.conv_fy == 1)
+                       & (out.conv_fz == 1)).astype(int)
+
     dest = os.path.join(args.dataset, "permeability.csv")
     out.to_csv(dest, index=False)
-    print(f"merged {len(out)} rows -> {dest}")
 
-    conv = (out.conv_fx == 1) & (out.conv_fy == 1) & (out.conv_fz == 1)
+    # --- manifest -----------------------------------------------------------
+    # This run is days long and the table is read while it is still filling, so
+    # every merge records what the snapshot was.  A RESULTS/ directory trained
+    # against a partial table is only interpretable next to n_rows and
+    # sha256_ids; without them two runs a day apart are silently incomparable.
+    ids = out.sample_id.to_numpy()
+    meta = {
+        "dataset": args.dataset,
+        "labels": dest,
+        "merged": datetime.now().isoformat(timespec="seconds"),
+        "n_structures": int(len(df)),
+        "n_rows": int(len(out)),
+        "n_converged": int(out.conv_all.sum()),
+        "sample_id_min": int(ids.min()),
+        "sample_id_max": int(ids.max()),
+        "contiguous": bool(len(ids) == ids.max() - ids.min() + 1),
+        "sha256_ids": hashlib.sha256(
+            ",".join(str(int(i)) for i in ids).encode()).hexdigest(),
+        "strata": out.stratum.value_counts().to_dict(),
+    }
+    man = os.path.splitext(dest)[0] + "_manifest.json"
+    with open(man, "w") as fh:
+        json.dump(meta, fh, indent=2)
+
+    print(f"merged {len(out)}/{len(df)} rows -> {dest}")
+    print(f"  manifest -> {man}")
+    print(f"  ids {ids.min()}..{ids.max()}"
+          f"{'' if meta['contiguous'] else '  (GAPS -- the solve order is not a prefix)'}")
+    print(f"  strata: {meta['strata']}")
+
+    conv = out.conv_all == 1
     print(f"all three directions converged: {conv.sum()}/{len(out)}")
     cols = (["recip_resid", "fa", "k_mean", "k_ratio"]
             + [f"koff_over_trace_{a}{b}" for a, b in (("x","y"),("x","z"),("y","z"))]
             + [f"koff_rel_err_{a}{b}" for a, b in (("x","y"),("x","z"),("y","z"))])
     print(out.loc[conv, cols].describe().T.to_string())
+
+    # The ceiling train_catboost.py prints for the 2D k_off, one per target
+    # here: R^2 against a label this noisy is bounded by 1 - var(noise)/var(sig).
+    # It is printed at merge time because the 3D column names give that function
+    # no k_yx to find, so its own check stays silent on 3D by design.
+    print("\n  label-noise ceiling on R^2 (from K = K^T)")
+    for t, c in koff_ceilings3d(out.loc[conv]).items():
+        print(f"    {t}: R^2 <= {c:.6f}")
 
 
 if __name__ == "__main__":

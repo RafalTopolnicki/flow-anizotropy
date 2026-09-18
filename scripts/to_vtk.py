@@ -4,7 +4,20 @@ ParaView opens directly.
 
     python scripts/to_vtk.py field.npy field.vtk
     python scripts/to_vtk.py field.npy field.vtk --solid solid.npy
+    python scripts/to_vtk.py -o all.vtk --solid solid.npy \\
+           --field velocity_fx=s0.fx.npy --field velocity_fy=s0.fy.npy
     python scripts/to_vtk.py --self-test
+
+Several fields on one grid
+--------------------------
+`write_vtk_multi` (and `--field NAME=FILE`, repeatable) puts any number of named
+arrays into a **single** file, which is how the per-direction velocity fields are
+written: one dataset carrying `velocity_fx`, `velocity_fy`, `velocity_fz`, their
+magnitudes and `solid`, instead of one file per forcing direction.  In ParaView
+that means one Threshold and one pipeline, with the direction chosen from the
+array dropdown, rather than three datasets whose cameras and colour ranges have
+to be kept in step by hand.  It is also marginally *smaller* than the split form,
+since `solid` and the geometry are stored once instead of three times.
 
 Array convention
 ----------------
@@ -37,7 +50,7 @@ import sys
 
 import numpy as np
 
-__all__ = ["write_vtk"]
+__all__ = ["write_vtk", "write_vtk_multi", "tile_field"]
 
 
 def _grid_shape(arr, kind):
@@ -78,40 +91,92 @@ def _as_vtk_vectors(arr, ncomp):
     return out
 
 
-def write_vtk(path, field, name="velocity", kind=None, solid=None,
-              magnitude=True, ascii_mode=False, title="flow-anizotropy"):
+def tile_field(arr, n, kind):
     """
-    Write `field` to `path` as a legacy VTK STRUCTURED_POINTS dataset.
+    Replicate a field n times along each grid axis.
 
+    The LBM cell is periodic, but a VTK dataset is not: `vtkStreamTracer` stops
+    at the bounds, so a streamline leaving the top edge does not re-enter at the
+    bottom.  Tiling is the fix — the copies carry the true neighbour relation, so
+    the lines run on continuously across the seams.
+
+    No off-by-one: the period is exactly the node count (node nx-1's neighbour is
+    node 0), so plain replication puts the right value next to the right value at
+    every seam.  Only the outer boundary of the whole tiled block is artificial,
+    and that is unavoidable.
+    """
+    if n == 1:
+        return arr
+    if n < 1:
+        raise ValueError(f"--tile must be >= 1, got {n}")
+    ndim = arr.ndim - (1 if kind == "vector" else 0)
+    reps = (n,) * ndim + ((1,) if kind == "vector" else ())
+    return np.tile(arr, reps)
+
+
+def _field_arrays(name, field, kind, magnitude):
+    """The (declaration, payload) pairs one named field contributes."""
+    if any(c.isspace() for c in name) or not name:
+        raise ValueError(f"array name {name!r} must be non-empty and whitespace-free "
+                         f"(legal VTK names are whitespace-delimited)")
+    _, ncomp = _grid_shape(field, kind)
+    if kind == "vector":
+        out = [([f"VECTORS {name} float"],
+                _as_vtk_vectors(field, ncomp).astype(np.float32))]
+        if magnitude:
+            mag = np.linalg.norm(field.reshape(-1, ncomp), axis=1)
+            out.append(([f"SCALARS {name}_magnitude float 1", "LOOKUP_TABLE default"],
+                        mag.astype(np.float32)))
+        return out
+    return [([f"SCALARS {name} float 1", "LOOKUP_TABLE default"],
+             field.reshape(-1).astype(np.float32))]
+
+
+def write_vtk_multi(path, fields, solid=None, magnitude=True, ascii_mode=False,
+                    kinds=None, tile=1, title="flow-anizotropy"):
+    """
+    Write several named arrays on one grid to a single legacy VTK file.
+
+    fields     mapping {name: array}; every array must share the same grid, and
+               insertion order is the order they appear in the file (the first
+               vector becomes VTK's active one, which is what ParaView preselects).
     solid      optional mask on the same grid, added as a scalar array so the
                geometry can be shown alongside the flow (a Threshold in ParaView).
-    magnitude  for a vector field, also write |v| as a scalar — saves reaching
-               for a Calculator filter just to colour by speed.
+    magnitude  for each vector field, also write |v| as `<name>_magnitude` —
+               saves reaching for a Calculator filter just to colour by speed.
+    kinds      optional {name: "vector"|"scalar"} to override the per-field guess.
+    tile       replicate the periodic cell n times along each axis, so streamlines
+               cross the seams instead of stopping at them (`tile_field`).  Costs
+               n^2 in 2D and n^3 in 3D, in both file size and ParaView memory.
     """
-    field = np.asarray(field)
-    kind = kind or _guess_kind(field)
-    grid, ncomp = _grid_shape(field, kind)
+    if not fields:
+        raise ValueError("no fields given")
+    kinds = kinds or {}
+
+    grid = None
+    arrays = []          # (declaration lines, flat float32/uint8 payload)
+    for name, field in fields.items():
+        field = np.asarray(field)
+        kind = kinds.get(name) or _guess_kind(field)
+        g, _ = _grid_shape(field, kind)
+        if grid is None:
+            grid = g
+        elif tuple(g) != tuple(grid):
+            raise ValueError(f"field {name!r} has grid {g}, expected {grid}")
+        arrays.extend(_field_arrays(name, tile_field(field, tile, kind),
+                                    kind, magnitude))
+    grid = tuple(d * tile for d in grid)
+
     nx, ny, nz = _dims(grid)
     npoints = nx * ny * nz
 
-    arrays = []          # (declaration lines, flat float32/uint8 payload)
-    if kind == "vector":
-        vec = _as_vtk_vectors(field, ncomp)
-        arrays.append(([f"VECTORS {name} float"], vec.astype(np.float32)))
-        if magnitude:
-            mag = np.linalg.norm(field.reshape(-1, ncomp), axis=1)
-            arrays.append(([f"SCALARS {name}_magnitude float 1", "LOOKUP_TABLE default"],
-                           mag.astype(np.float32)))
-    else:
-        arrays.append(([f"SCALARS {name} float 1", "LOOKUP_TABLE default"],
-                       field.reshape(-1).astype(np.float32)))
-
     if solid is not None:
         solid = np.asarray(solid)
-        if tuple(solid.shape) != tuple(grid):
-            raise ValueError(f"solid shape {solid.shape} does not match grid {grid}")
+        if tuple(d * tile for d in solid.shape) != tuple(grid):
+            raise ValueError(f"solid shape {solid.shape} does not match grid "
+                             f"{tuple(d // tile for d in grid)}")
         arrays.append((["SCALARS solid unsigned_char 1", "LOOKUP_TABLE default"],
-                       solid.reshape(-1).astype(np.uint8)))
+                       tile_field(solid, tile, "scalar").reshape(-1).astype(np.uint8)))
 
     header = (
         "# vtk DataFile Version 3.0\n"
@@ -138,6 +203,14 @@ def write_vtk(path, field, name="velocity", kind=None, solid=None,
                 fh.write(big.tobytes())
                 fh.write(b"\n")
     return path
+
+
+def write_vtk(path, field, name="velocity", kind=None, solid=None,
+              magnitude=True, ascii_mode=False, tile=1, title="flow-anizotropy"):
+    """One named field to `path` — the single-array case of `write_vtk_multi`."""
+    return write_vtk_multi(path, {name: field}, solid=solid, magnitude=magnitude,
+                           ascii_mode=ascii_mode, tile=tile,
+                           kinds={name: kind} if kind else None, title=title)
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +286,71 @@ def _self_test():
     check("scalar (ny,nx) auto-detected", _guess_kind(np.zeros((4, 4))) == "scalar")
     check("vector (ny,nx,2) auto-detected", _guess_kind(np.zeros((4, 4, 2))) == "vector")
 
+    # 6. several named fields in one file — the form solve_velocity*.py writes
+    g2 = np.stack([yy, xx], axis=-1).astype(np.float64)          # v = (y, x)
+    write_vtk_multi(tmp / "m.vtk", {"velocity_fx": f, "velocity_fy": g2},
+                    solid=solid, ascii_mode=True)
+    mt = (tmp / "m.vtk").read_text()
+    for want in ("VECTORS velocity_fx float", "VECTORS velocity_fy float",
+                 "SCALARS velocity_fx_magnitude float 1",
+                 "SCALARS velocity_fy_magnitude float 1",
+                 "SCALARS solid unsigned_char 1"):
+        check(f"multi: {want!r} present", want in mt)
+    check("multi: one POINT_DATA declaration only", mt.count("POINT_DATA") == 1)
+    check("multi: solid written once", mt.count("SCALARS solid") == 1)
+
+    # each field keeps its own values — a shared buffer would alias them
+    ml = mt.splitlines()
+    for nm, src in (("velocity_fx", f), ("velocity_fy", g2)):
+        k = ml.index(f"VECTORS {nm} float")
+        body = np.array([[float(s) for s in ln.split()]
+                         for ln in ml[k + 1: k + 1 + nx * ny]])
+        check(f"multi: {nm} holds its own data",
+              np.array_equal(body[:, :2], src.reshape(-1, 2)))
+
+    try:
+        write_vtk_multi(tmp / "bad2.vtk", {"a": f, "b": np.zeros((2, 2, 2))},
+                        ascii_mode=True)
+        check("multi: mismatched grids rejected", False)
+    except ValueError:
+        check("multi: mismatched grids rejected", True)
+
+    try:
+        write_vtk_multi(tmp / "bad3.vtk", {"two words": f}, ascii_mode=True)
+        check("multi: whitespace in array name rejected", False)
+    except ValueError:
+        check("multi: whitespace in array name rejected", True)
+
+    # 7. periodic tiling
+    write_vtk_multi(tmp / "t.vtk", {"velocity": f}, solid=solid, tile=3,
+                    ascii_mode=True, magnitude=False)
+    tt = (tmp / "t.vtk").read_text().splitlines()
+    check("tile=3 scales DIMENSIONS", f"DIMENSIONS {nx*3} {ny*3} 1" in tt)
+    check("tile=3 scales POINT_DATA", f"POINT_DATA {nx*ny*9}" in tt)
+    kk = tt.index("VECTORS velocity float")
+    tb = np.array([[float(s) for s in ln.split()]
+                   for ln in tt[kk + 1: kk + 1 + nx * ny * 9]]).reshape(ny*3, nx*3, 3)
+    check("tile=3 block (1,1) equals block (0,0)",
+          np.array_equal(tb[ny:2*ny, nx:2*nx], tb[:ny, :nx]))
+    check("tile=3 first block is the original field",
+          np.array_equal(tb[:ny, :nx, :2], f))
+    check("tile=1 is a no-op", np.array_equal(tile_field(f, 1, "vector"), f))
+    check("tile_field on a 3D vector keeps the component axis",
+          tile_field(g, 2, "vector").shape == (nz3*2, ny3*2, nx3*2, 3))
+    check("tile_field on a 3D scalar",
+          tile_field(zz, 2, "scalar").shape == (nz3*2, ny3*2, nx3*2))
+    try:
+        tile_field(f, 0, "vector")
+        check("tile < 1 rejected", False)
+    except ValueError:
+        check("tile < 1 rejected", True)
+
+    # write_vtk must stay exactly the single-field case of write_vtk_multi
+    write_vtk(tmp / "one_a.vtk", f, ascii_mode=True, solid=solid)
+    write_vtk_multi(tmp / "one_b.vtk", {"velocity": f}, ascii_mode=True, solid=solid)
+    check("write_vtk == write_vtk_multi on one field",
+          (tmp / "one_a.vtk").read_bytes() == (tmp / "one_b.vtk").read_bytes())
+
     print("self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -222,10 +360,17 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("input", nargs="?", help="input .npy")
     p.add_argument("output", nargs="?", help="output .vtk")
+    p.add_argument("-o", "--output-file", dest="out",
+                   help="output .vtk (required with --field)")
+    p.add_argument("--field", action="append", default=[], metavar="NAME=FILE",
+                   help="add a named array; repeatable, all on one grid")
     p.add_argument("--name", default="velocity", help="array name in the VTK file")
     p.add_argument("--kind", choices=["vector", "scalar"],
                    help="override the vector/scalar guess")
     p.add_argument("--solid", help="optional .npy mask on the same grid")
+    p.add_argument("--tile", type=int, default=1, metavar="N",
+                   help="replicate the periodic cell N times along each axis so "
+                        "streamlines cross the seams (costs N^2 in 2D, N^3 in 3D)")
     p.add_argument("--ascii", action="store_true", help="ASCII instead of binary")
     p.add_argument("--no-magnitude", action="store_true")
     p.add_argument("--self-test", action="store_true")
@@ -233,15 +378,33 @@ def main():
 
     if a.self_test:
         return _self_test()
-    if not a.input or not a.output:
-        p.error("input and output are required (or use --self-test)")
 
-    field = np.load(a.input)
     solid = np.load(a.solid) if a.solid else None
-    write_vtk(a.output, field, name=a.name, kind=a.kind, solid=solid,
+    mode = "ascii" if a.ascii else "binary"
+
+    if a.field:
+        if a.input or a.output:
+            p.error("use --field with -o/--output-file, not positional arguments")
+        out = a.out or p.error("-o/--output-file is required with --field")
+        fields = {}
+        for spec in a.field:
+            if "=" not in spec:
+                p.error(f"--field wants NAME=FILE, got {spec!r}")
+            name, _, src = spec.partition("=")
+            fields[name] = np.load(src)
+            print(f"  {name:20s} {src} {fields[name].shape}")
+        write_vtk_multi(out, fields, solid=solid, tile=a.tile,
+                        magnitude=not a.no_magnitude, ascii_mode=a.ascii)
+        print(f"{len(fields)} fields -> {out} ({mode})")
+        return 0
+
+    out = a.output or a.out
+    if not a.input or not out:
+        p.error("input and output are required (or use --field, or --self-test)")
+    field = np.load(a.input)
+    write_vtk(out, field, name=a.name, kind=a.kind, solid=solid, tile=a.tile,
               magnitude=not a.no_magnitude, ascii_mode=a.ascii)
-    print(f"{a.input} {field.shape} -> {a.output} "
-          f"({'ascii' if a.ascii else 'binary'})")
+    print(f"{a.input} {field.shape} -> {out} ({mode})")
     return 0
 
 

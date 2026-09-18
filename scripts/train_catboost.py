@@ -7,8 +7,9 @@ non-topological directional baselines — is a single table.
 
 Feature groups (matched by column prefix)
 -----------------------------------------
-    ecp, ph            direction-aware TDA
+    ecp, ph            direction-aware TDA (the wedge filtration)
     tda                ecp + ph
+    thr                throat-scale PH (the distance-transform filtration)
     por, tpc, fab      directional baselines
     baselines          por + tpc + fab
     porosity           the scalar alone (the null model)
@@ -50,7 +51,11 @@ import time
 
 import numpy as np
 import pandas as pd
+import sys
 from sklearn.model_selection import KFold
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from metrics import fold_metrics, summarize, fmt, write_metrics_json  # noqa: E402
 
 PREFIXES = {
     "ecp": ("ecp_",),
@@ -59,8 +64,35 @@ PREFIXES = {
     "por": ("por_",),
     "tpc": ("tpc_",),
     "fab": ("fab_",),
-    "baselines": ("por_", "tpc_", "fab_"),
-    "all": ("ecp_", "ph_", "por_", "tpc_", "fab_"),
+    # 3D only: the directional fabric profile (baselines3d.py). It is a separate
+    # prefix on purpose -- "fabdir_" does not match "fab_", so the 10-feature
+    # global fabric tensor stays comparable with the 2D `fab` group instead of
+    # being diluted by 720 profile features. It must be listed explicitly in
+    # `baselines` and `all` or it is silently never used. Matches nothing in the
+    # 2D CSVs, so the 2D runs are unaffected.
+    "fabdir": ("fabdir_",),
+    # Non-additive pore-connectivity features (connect2d.py): spanning-cluster
+    # fractions, dead pore volume, and geodesic tortuosity in four directions.
+    # Kept OUT of `baselines` and `all` on purpose -- those two names index
+    # runs already recorded in RESULTS/summary.csv, and silently widening them
+    # would make old and new numbers incomparable under the same label. The
+    # combinations get their own names instead.
+    "conn": ("conn_",),
+    # Throat-scale PH from the distance transform (filtration_throat2d.py).
+    # A separate prefix for the same reason as `conn_`: `ph`, `tda` and `all`
+    # name runs already in RESULTS/summary.csv and are built on the WEDGE
+    # filtration, so the throat descriptors get their own group names rather
+    # than silently redefining those.
+    "thr": ("thr_",),
+    "baselines": ("por_", "tpc_", "fab_", "fabdir_"),
+    "all": ("ecp_", "ph_", "por_", "tpc_", "fab_", "fabdir_"),
+    "baselines+conn": ("por_", "tpc_", "fab_", "fabdir_", "conn_"),
+    "tda+conn": ("ecp_", "ph_", "conn_"),
+    "all+conn": ("ecp_", "ph_", "por_", "tpc_", "fab_", "fabdir_", "conn_"),
+    "tpc+thr": ("tpc_", "thr_"),
+    "baselines+thr": ("por_", "tpc_", "fab_", "fabdir_", "thr_"),
+    "tda+thr": ("ecp_", "ph_", "thr_"),
+    "all+thr": ("ecp_", "ph_", "por_", "tpc_", "fab_", "fabdir_", "thr_"),
 }
 
 TARGET_GROUPS = {
@@ -151,8 +183,9 @@ def main():
         df = df.merge(extra.drop(columns=drop), on="sample_id", how="inner")
 
     n0 = len(df)
-    if {"conv_fx", "conv_fy"} <= set(df.columns):
-        df = df[(df.conv_fx == 1) & (df.conv_fy == 1)]
+    conv = [c for c in ("conv_fx", "conv_fy", "conv_fz") if c in df.columns]
+    if conv:
+        df = df[(df[conv] == 1).all(axis=1)]
     if a.strata:
         df = df[df.stratum.isin(a.strata)]
     if a.limit:
@@ -168,6 +201,7 @@ def main():
     os.makedirs(a.output, exist_ok=True)
     cv = KFold(a.folds, shuffle=True, random_state=a.seed)
     rows = []
+    per_fold = []
 
     for group in a.groups:
         cols = select(df, group)
@@ -180,9 +214,8 @@ def main():
             Y = df[targets].to_numpy(np.float64)
             ok = np.isfinite(Y).all(1)
             per = {t: [] for t in targets}
-            maes = {t: [] for t in targets}
             t0 = time.time()
-            for tr, te in cv.split(X[ok]):
+            for f_i, (tr, te) in enumerate(cv.split(X[ok])):
                 m = cb.CatBoostRegressor(iterations=a.iterations, depth=a.depth,
                                          learning_rate=a.lr, random_seed=a.seed,
                                          loss_function="MultiRMSE", verbose=0,
@@ -190,49 +223,47 @@ def main():
                 m.fit(X[ok][tr], Y[ok][tr])
                 pred = np.atleast_2d(m.predict(X[ok][te]))
                 for i, t in enumerate(targets):
-                    yt, yp = Y[ok][te][:, i], pred[:, i]
-                    ss = ((yt - yt.mean()) ** 2).sum()
-                    per[t].append(1 - ((yt - yp) ** 2).sum() / ss if ss > 0 else np.nan)
-                    maes[t].append(np.abs(yt - yp).mean())
+                    per[t].append(fold_metrics(Y[ok][te][:, i], pred[:, i], fold=f_i))
             secs = round(time.time() - t0, 1)
             for t in targets:
+                summ = summarize(per[t])
                 rows.append({"group": group, "n_features": len(cols), "target": t,
-                             "mode": "joint",
-                             "r2_mean": float(np.mean(per[t])),
-                             "r2_std": float(np.std(per[t])),
-                             "mae_mean": float(np.mean(maes[t])),
+                             "mode": "joint", **summ,
                              "n": int(ok.sum()), "seconds": secs})
-                print(f"  {group:10s} {len(cols):5d}f  {t:14s} [joint] "
-                      f"R2 {rows[-1]['r2_mean']:7.4f} ± {rows[-1]['r2_std']:.4f}   "
-                      f"MAE {rows[-1]['mae_mean']:.4g}")
+                per_fold.append({"group": group, "target": t, "mode": "joint",
+                                 "n_features": len(cols), "n": int(ok.sum()),
+                                 "seconds": secs, "folds": per[t], **summ})
+                print(f"  {group:10s} {len(cols):5d}f  {t:14s} [joint] {fmt(summ)}")
             continue
 
         for t in targets:
             y = df[t].to_numpy(np.float64)
             ok = np.isfinite(y)
-            r2s, maes = [], []
+            folds = []
             t0 = time.time()
-            for tr, te in cv.split(X[ok]):
+            for f_i, (tr, te) in enumerate(cv.split(X[ok])):
                 m = cb.CatBoostRegressor(iterations=a.iterations, depth=a.depth,
                                          learning_rate=a.lr, random_seed=a.seed,
                                          verbose=0, allow_writing_files=False)
                 m.fit(X[ok][tr], y[ok][tr])
-                pred = m.predict(X[ok][te])
-                yt = y[ok][te]
-                ss = ((yt - yt.mean()) ** 2).sum()
-                r2s.append(1 - ((yt - pred) ** 2).sum() / ss if ss > 0 else np.nan)
-                maes.append(np.abs(yt - pred).mean())
+                folds.append(fold_metrics(y[ok][te], m.predict(X[ok][te]), fold=f_i))
+            secs = round(time.time() - t0, 1)
+            summ = summarize(folds)
             rows.append({"group": group, "n_features": len(cols), "target": t,
-                         "mode": "single",
-                         "r2_mean": float(np.mean(r2s)), "r2_std": float(np.std(r2s)),
-                         "mae_mean": float(np.mean(maes)), "n": int(ok.sum()),
-                         "seconds": round(time.time() - t0, 1)})
-            print(f"  {group:10s} {len(cols):5d}f  {t:14s} "
-                  f"R2 {rows[-1]['r2_mean']:7.4f} ± {rows[-1]['r2_std']:.4f}   "
-                  f"MAE {rows[-1]['mae_mean']:.4g}   ({rows[-1]['seconds']}s)")
+                         "mode": "single", **summ,
+                         "n": int(ok.sum()), "seconds": secs})
+            per_fold.append({"group": group, "target": t, "mode": "single",
+                             "n_features": len(cols), "n": int(ok.sum()),
+                             "seconds": secs, "folds": folds, **summ})
+            print(f"  {group:10s} {len(cols):5d}f  {t:14s} {fmt(summ)}  ({secs}s)")
 
     res = pd.DataFrame(rows)
     res.to_csv(os.path.join(a.output, "results.csv"), index=False)
+    write_metrics_json(a.output,
+                       {"kind": "catboost", "folds": a.folds, "seed": a.seed,
+                        "iterations": a.iterations, "depth": a.depth, "lr": a.lr,
+                        "n_rows": len(df), "koff_ceiling": ceiling},
+                       per_fold)
     with open(os.path.join(a.output, "arguments.json"), "w") as fh:
         json.dump({**vars(a), "n_rows": len(df), "koff_ceiling": ceiling}, fh, indent=2)
 

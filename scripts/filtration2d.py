@@ -22,8 +22,33 @@ Channels, per pixel, for a chosen direction d = (cos θ, sin θ)
    top eigenvector v, then `dir = 1 - |v·d|`. Small means the local solid
    structure runs along d.
 
-Void pixels get the sentinel 1.25 in both channels, as in 3D, so they enter
-every sublevel set only after all solid pixels.
+Which phase? — `--phase solid` (default) or `--phase void`
+---------------------------------------------------------
+The elasticity original computes both channels **on solid voxels only** and
+gives void the sentinel 1.25, so void enters every sublevel set last, all at
+once.  That is right for stiffness, where the solid carries the load.  It is
+the wrong phase for flow: the pore space carries the flux, and in this dataset
+the solid fraction is only ~0.15, so the solid convention computes real values
+on a seventh of the cell and hands the other six sevenths to the model as one
+undifferentiated blob.
+
+`--phase void` swaps the roles symmetrically — the descriptor is then *about*
+the pore space, and `fg` is the only thing that changes:
+
+    wedge = 1 - (void pixels in the wedge) / (wedge area)
+
+so 0 is a pore pixel whose double cone along d is wide open and 1 is one whose
+cone is blocked.  The sublevel filtration therefore grows the pore space from
+the most open regions along d outward, and an H0 merge time is **the
+constriction at which two open pore regions first connect along d** — the
+critical-path quantity permeability actually obeys.  The PCA channel likewise
+becomes the local elongation of the *pore*, not of the solid.
+
+Note that relabelling alone would buy nothing: on a torus χ(A) = -χ(Aᶜ), so the
+Euler characteristics of the complements of the solid sublevel sets are already
+determined by the solid ECP.  What makes this a different descriptor is that
+the filtration *function* now lives on the void, so its sublevel sets are not
+those complements.
 
 Departures from the 3D code, all intentional
 --------------------------------------------
@@ -50,7 +75,8 @@ Usage
 -----
     python scripts/filtration2d.py --self-test
     python scripts/filtration2d.py --dataset DATA/aniso --outputdir DESC/filt \
-        --direction 45 [--radius 4] [--wedge-radius 3] [--wedge-height 6] \
+        --direction 45 [--phase solid|void] \
+        [--radius 4] [--wedge-radius 3] [--wedge-height 6] \
         [--workers 14] [--limit N]
 """
 
@@ -137,15 +163,19 @@ def _top_evec_2x2(a, b, c):
 
 
 @njit(parallel=True, cache=True)
-def _filtration(grid, wedge_off, disc_off, d_i, d_j):
-    """grid: uint8 (H, W), 1 = solid. Returns (H, W, 2) float32."""
+def _filtration(grid, wedge_off, disc_off, d_i, d_j, fg):
+    """
+    grid: uint8 (H, W), 1 = solid.  `fg` selects the phase the descriptor is
+    *about*: 1 = solid (the elasticity convention), 0 = void (the pore space).
+    Every pixel not in that phase gets the 1.25 sentinel.  Returns (H, W, 2).
+    """
     H, W = grid.shape
     out = np.empty((H, W, 2), dtype=np.float32)
     n_wedge = wedge_off.shape[0]
 
     for i in prange(H):
         for j in range(W):
-            if grid[i, j] == 0:
+            if grid[i, j] != fg:
                 out[i, j, 0] = 1.25
                 out[i, j, 1] = 1.25
                 continue
@@ -153,7 +183,7 @@ def _filtration(grid, wedge_off, disc_off, d_i, d_j):
             # --- channel 0: wedge occupancy -------------------------------
             filled = 0
             for k in range(n_wedge):
-                if _at(grid, i + wedge_off[k, 0], j + wedge_off[k, 1]) != 0:
+                if _at(grid, i + wedge_off[k, 0], j + wedge_off[k, 1]) == fg:
                     filled += 1
             out[i, j, 0] = 1.0 - filled / n_wedge if n_wedge > 0 else 1.0
 
@@ -163,7 +193,7 @@ def _filtration(grid, wedge_off, disc_off, d_i, d_j):
             for k in range(disc_off.shape[0]):
                 di = disc_off[k, 0]
                 dj = disc_off[k, 1]
-                if _at(grid, i + di, j + dj) == 0:
+                if _at(grid, i + di, j + dj) != fg:
                     continue
                 n += 1.0
                 fi = float(di)
@@ -189,14 +219,19 @@ def _filtration(grid, wedge_off, disc_off, d_i, d_j):
     return out
 
 
+PHASES = {"solid": 1, "void": 0}
+
+
 def compute(grid: np.ndarray, theta_deg: float, radius: int = 4,
-            wedge_radius: float = 3.0, wedge_height: float = 6.0) -> np.ndarray:
+            wedge_radius: float = 3.0, wedge_height: float = 6.0,
+            phase: str = "solid") -> np.ndarray:
     """Filtration of a binary structure (1 = solid) along θ degrees from +x."""
     t = np.radians(theta_deg)
     return _filtration(np.ascontiguousarray(grid, dtype=np.uint8),
                        wedge_offsets(theta_deg, wedge_radius, wedge_height),
                        disc_offsets(radius),
-                       float(np.sin(t)), float(np.cos(t)))
+                       float(np.sin(t)), float(np.cos(t)),
+                       np.uint8(PHASES[phase]))
 
 
 # ---------------------------------------------------------------------------
@@ -204,15 +239,16 @@ def compute(grid: np.ndarray, theta_deg: float, radius: int = 4,
 # ---------------------------------------------------------------------------
 
 def _one(args):
-    path, out_path, theta, radius, wr, wh = args
+    path, out_path, theta, radius, wr, wh, phase = args
     if os.path.exists(out_path):
         return "cached"
-    filt = compute(load_structure(path), theta, radius, wr, wh)
+    filt = compute(load_structure(path), theta, radius, wr, wh, phase)
     np.save(out_path, filt)
     return "ok"
 
 
-def run(dataset, outputdir, theta, radius, wr, wh, workers, limit):
+def run(dataset, outputdir, theta, radius, wr, wh, workers, limit,
+        phase="solid"):
     import pandas as pd
     df = pd.read_csv(os.path.join(dataset, "structures.csv"))
     if limit:
@@ -221,7 +257,7 @@ def run(dataset, outputdir, theta, radius, wr, wh, workers, limit):
 
     tasks = [(os.path.join(dataset, "structures", r.filename),
               os.path.join(outputdir, r.filename.replace(".gif", ".npy")),
-              theta, radius, wr, wh)
+              theta, radius, wr, wh, phase)
              for r in df.itertuples()]
 
     from tqdm import tqdm
@@ -229,7 +265,7 @@ def run(dataset, outputdir, theta, radius, wr, wh, workers, limit):
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futs = [pool.submit(_one, t) for t in tasks]
         for f in tqdm(as_completed(futs), total=len(futs),
-                      desc=f"filtration θ={theta:g}°"):
+                      desc=f"filtration {phase} θ={theta:g}°"):
             done += f.result() == "ok"
     print(f"  {done} computed, {len(tasks) - done} cached -> {outputdir}")
 
@@ -302,6 +338,55 @@ def self_test():
           np.allclose(np.rot90(a), b, atol=1e-6),
           f"max diff {np.abs(np.rot90(a) - b).max():.2e}")
 
+    # ---- phase: void ------------------------------------------------------
+    # The two phases must be exact mirror images of one another: computing the
+    # void filtration of g is the same thing as computing the solid filtration
+    # of its complement.  This is the check that catches a half-applied swap,
+    # where (say) the wedge count follows `fg` but the PCA loop does not.
+    rng = np.random.default_rng(1)
+    g = (rng.random((64, 64)) > 0.55).astype(np.uint8)
+    for th in (0.0, 45.0):
+        v = compute(g, th, phase="void")
+        c = compute((1 - g).astype(np.uint8), th, phase="solid")
+        check(f"void(g) == solid(1-g) at θ={th:g}°", np.allclose(v, c, atol=0),
+              f"max diff {np.abs(v - c).max():.2e}")
+
+    empty = np.zeros((32, 32), dtype=np.uint8)
+    f = compute(empty, 0.0, phase="void")
+    check("all-void gives wedge = 0 in void phase", np.allclose(f[..., 0], 0.0),
+          f"max {f[..., 0].max():.3g}")
+    h = np.zeros((32, 32), dtype=np.uint8)
+    h[16, 16] = 1
+    f = compute(h, 0.0, phase="void")
+    check("solid pixel gets the 1.25 sentinel in void phase",
+          f[16, 16, 0] == 1.25)
+
+    # Open pore channels running along x: at θ=0 the wedge lies inside the
+    # channel and reads open (low); at θ=90 it crosses the walls (high).
+    walls = np.zeros((64, 64), dtype=np.uint8)
+    for k in range(0, 64, 16):
+        walls[k:k + 8] = 1                  # 8-thick solid walls along x
+    pore = walls == 0
+    v0 = compute(walls, 0.0, phase="void")
+    v90 = compute(walls, 90.0, phase="void")
+    m0 = v0[..., 0][pore].mean()
+    m90 = v90[..., 0][pore].mean()
+    check("void wedge is direction-sensitive on channels", m0 < m90 - 0.3,
+          f"mean wedge along={m0:.3f} across={m90:.3f}")
+    d0 = v0[..., 1][pore].mean()
+    d90 = v90[..., 1][pore].mean()
+    check("void PCA channel aligns with the channel direction",
+          d0 < 0.1 and d90 > 0.9, f"dir(θ=0)={d0:.3f} dir(θ=90)={d90:.3f}")
+
+    # The void filtration must cover the majority of a high-porosity cell --
+    # the whole point of the switch.  On this dataset solid is ~0.15.
+    sparse = (rng.random((64, 64)) > 0.85).astype(np.uint8)
+    cov_v = (compute(sparse, 0.0, phase="void")[..., 0] < 1.25).mean()
+    cov_s = (compute(sparse, 0.0, phase="solid")[..., 0] < 1.25).mean()
+    check("void phase carries the majority of a porous cell",
+          cov_v > 0.8 and cov_s < 0.2,
+          f"non-sentinel fraction void={cov_v:.3f} solid={cov_s:.3f}")
+
     print("\nself-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -313,6 +398,9 @@ def main():
     p.add_argument("--outputdir")
     p.add_argument("--direction", type=float, default=0.0,
                    help="degrees CCW from +x (same frame as theta_deg)")
+    p.add_argument("--phase", choices=sorted(PHASES), default="solid",
+                   help="phase the descriptor is about: solid (the elasticity "
+                        "convention) or void (the pore space, for flow)")
     p.add_argument("--radius", type=int, default=4)
     p.add_argument("--wedge-radius", type=float, default=3.0)
     p.add_argument("--wedge-height", type=float, default=6.0)
@@ -326,7 +414,7 @@ def main():
     if not (a.dataset and a.outputdir):
         p.error("--dataset and --outputdir are required (or use --self-test)")
     run(a.dataset, a.outputdir, a.direction, a.radius,
-        a.wedge_radius, a.wedge_height, a.workers, a.limit)
+        a.wedge_radius, a.wedge_height, a.workers, a.limit, a.phase)
 
 
 if __name__ == "__main__":

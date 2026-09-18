@@ -8,6 +8,12 @@ cleanly and the headline tier is readable long before the rest finishes.
     python scripts/collect_results.py --results RESULTS
     python scripts/collect_results.py --results RESULTS --target k_off
 
+Each unit also writes `metrics.json` beside its `results.csv`, holding R^2, MAE
+and MSE for every fold — read that when you need a paired comparison between two
+feature groups, or to see whether one fold carries all the variance.  The folds
+are identical across groups for a given target (same rows, same KFold seed), so
+paired tests are valid.
+
 Output: `RESULTS/summary.csv`, a pivot of R^2 by model and feature group, and
 the k_off ranking — the comparison the study turns on, and the one where NOTES
 5.6 predicted trouble (7 fabric features beat all 1124 TDA features at
@@ -23,7 +29,8 @@ import pandas as pd
 
 # TDA first, then baselines, then the nulls — so the printed table reads in the
 # order the argument is made rather than alphabetically.
-GROUP_ORDER = ["tda", "ecp", "ph", "all", "baselines", "fab", "tpc", "por", "porosity"]
+GROUP_ORDER = ["tda", "ecp", "ph", "all", "baselines", "fab", "fabdir",
+               "tpc", "por", "porosity"]
 
 
 def load(results):
@@ -88,7 +95,8 @@ def main():
 
     if a.target in set(r.target):
         sub = r[r.target == a.target].sort_values("r2_mean", ascending=False)
-        cols = [c for c in ("kind", "group", "mode", "r2_mean", "r2_std", "mae")
+        cols = [c for c in ("kind", "group", "mode", "r2_mean", "r2_std",
+                            "mae_mean", "mae_std", "mse_mean", "mse_std")
                 if c in sub.columns]
         print(f"\n=== ranked on {a.target} ===")
         print(sub[cols].head(12).to_string(index=False))

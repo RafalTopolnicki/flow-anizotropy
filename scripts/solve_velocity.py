@@ -1,20 +1,26 @@
 """
 Solve one structure and keep the velocity fields.
 
-    python scripts/solve_velocity.py DATA/aniso/structures/sample_000000_*.gif -o OUT/s0
-    python scripts/solve_velocity.py <structure.gif> -o OUT/s0 --vtk
+    python scripts/solve_velocity.py DATA/aniso/structures/sample_000000_*.gif -o VIZ/2d/s0
+    python scripts/solve_velocity.py <structure.gif> -o VIZ/2d/s0 --vtk
 
 Runs `lbm2d-perm` on the structure exactly the way the dataset run does — two
 solves of the same doubly periodic cell, force along +x then +y, the two columns
 of K — and additionally saves the converged velocity field of each run.
 
-Outputs, given `-o OUT/s0`:
+Outputs, given `-o VIZ/2d/s0` (the 2D half of VIZ; 3D lives in `VIZ/3d/`):
 
-    OUT/s0.fx.npy      (ny, nx, 2) float32   velocity under x-forcing
-    OUT/s0.fy.npy      (ny, nx, 2) float32   velocity under y-forcing
-    OUT/s0.solid.npy   (ny, nx)    uint8     1 = solid, 0 = pore
-    OUT/s0.csv                               the usual full tensor row
-    OUT/s0.fx.vtk, OUT/s0.fy.vtk             with --vtk
+    VIZ/2d/s0.fx.npy      (ny, nx, 2) float32   velocity under x-forcing
+    VIZ/2d/s0.fy.npy      (ny, nx, 2) float32   velocity under y-forcing
+    VIZ/2d/s0.solid.npy   (ny, nx)    uint8     1 = solid, 0 = pore
+    VIZ/2d/s0.csv                               the usual full tensor row
+    VIZ/2d/s0.vtk                               with --vtk
+
+The ParaView file is **one dataset carrying both directions** — `velocity_fx`,
+`velocity_fy`, their magnitudes and `solid` — not one file per direction.  Same
+grid, so one Threshold and one pipeline serve both, and the direction is chosen
+from the array dropdown instead of by keeping two datasets' cameras and colour
+ranges in step by hand.  `--split` restores the old file-per-direction form.
 
 Arrays are indexed ``[solver_y, solver_x]`` with components ``(u_x, u_y)`` — the
 same orientation `structure_io.load_structure` returns, so the field and the
@@ -49,7 +55,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from structure_io import load_structure          # noqa: E402
-from to_vtk import write_vtk                     # noqa: E402
+from to_vtk import write_vtk, write_vtk_multi    # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_SOLVER = REPO / "LMB2d" / "lbm2d-perm"
@@ -131,11 +137,21 @@ def run(args):
     _report(fields, solid, csv, out)
 
     if args.vtk:
-        for tag, field in fields.items():
-            write_vtk(f"{out}.{tag}.vtk", field, name="velocity", solid=solid,
-                      ascii_mode=args.ascii,
-                      title=f"{structure.name} force=+{tag[-1]}")
-            print(f"  wrote {out}.{tag}.vtk")
+        print()
+        if args.split:
+            for tag, field in fields.items():
+                write_vtk(f"{out}.{tag}.vtk", field, name="velocity", solid=solid,
+                          ascii_mode=args.ascii, tile=args.tile,
+                          title=f"{structure.name} force=+{tag[-1]}")
+                print(f"  wrote {out}.{tag}.vtk")
+        else:
+            write_vtk_multi(f"{out}.vtk",
+                            {f"velocity_{tag}": field for tag, field in fields.items()},
+                            solid=solid, ascii_mode=args.ascii, tile=args.tile,
+                            title=f"{structure.name} force=+x,+y")
+            mb = Path(f"{out}.vtk").stat().st_size / 1e6
+            print(f"  wrote {out}.vtk  ({mb:.1f} MB, arrays "
+                  f"{', '.join('velocity_' + tg for tg in fields)}, solid)")
 
     return 0
 
@@ -186,13 +202,19 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("structure", help="structure .gif (or .ppm/.dat)")
-    p.add_argument("-o", "--output", required=True, help="output prefix, e.g. OUT/s0")
+    p.add_argument("-o", "--output", required=True, help="output prefix, e.g. VIZ/2d/s0")
     p.add_argument("--solver", default=str(DEFAULT_SOLVER))
     p.add_argument("--ff", type=float, default=1)
     p.add_argument("--eps", type=float)
     p.add_argument("--max-steps", type=int)
     p.add_argument("--avg-steps", type=int)
-    p.add_argument("--vtk", action="store_true", help="also write ParaView .vtk files")
+    p.add_argument("--vtk", action="store_true", help="also write a ParaView .vtk file")
+    p.add_argument("--split", action="store_true",
+                   help="one .vtk per forcing direction instead of one combined file")
+    p.add_argument("--tile", type=int, default=1, metavar="N",
+                   help="replicate the periodic cell N times along each axis in the
+                        .vtk, so ParaView streamlines cross the seams instead of
+                        stopping at them (costs N^2 in 2D, N^3 in 3D)".replace("\n", " "))
     p.add_argument("--ascii", action="store_true", help="ASCII VTK instead of binary")
     p.add_argument("--keep-dat", action="store_true",
                    help="keep the solver's raw text .dat files")
