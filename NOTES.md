@@ -2728,3 +2728,207 @@ On disk: `scripts/filtration_throat2d.py`, `run_throat.sh`,
 `ph_screen.py` gained `--prefix`; `compare_runs.py` now reads every experiment
 in a `metrics.json` instead of only the first, which had silently compared the
 first group of a multi-group sweep and ignored the rest.
+
+## 12. The 3D arm — TDA beats the baselines (2026-09-17/18)
+
+### 12.1 What was built
+
+Step 0 of the post-§11.11 plan, ported to 3D: `scripts/filtration_throat3d.py`,
+the distance-transform filtration, run on the **existing 2816 labels**.  No new
+LBM.  Same two modes as 2D — `iso` (non-directional) and `dir` (minimum dt
+along a ±d walk, horizon 6) — on the **void** phase, RCAP = **10 voxels** (this
+dataset's dt p99.9), nine directions, `--limit 2816` because the labelled
+prefix is contiguous (sample_id 0..2815, no gaps).
+
+Self-test **23/23**, including the 3D-specific checks: periodic EDT against the
+minimum over all 27 torus translates; the `compute`/`compute_arr` frame split
+verified on a *diagonal*, where a (dx,dy,dz)<->(dz,dy,dx) swap would be
+invisible on an axis; all three axis transpositions; and **H0 death times
+recovering known cylinder-throat radii**.  The 3D recovery is exact up to
+voxelisation — measured radii come out at exactly sqrt(w^2 + 1) for w = 2..5,
+because the nearest solid voxel to a digitised cylinder's axis sits one voxel
+off the radial direction.  Hence the 0.25 vox tolerance here against 0.05 px in
+2D.
+
+`DATA/aniso3d` is markedly tighter than the 2D set and therefore friendlier to
+a throat descriptor: solid fraction **0.30** against 2D's 0.15, dt p50 **3.16**,
+p75 4.69, p90 6.16, p99 8.66, p99.9 10.34 voxels, per-structure max 6.6-13.3.
+Median inscribed radius of 3.16 voxels in an 80^3 cell is far narrower,
+relative to the cell, than 2D's 6.4 px in 256^2.
+
+### 12.2 A live bug in ph3d.py — every recorded 3D PH number was rank-1
+
+`ph3d.py` called `PersistenceImage(resolution, im_range)` with **both** of
+gudhi's defaults: constant weight and bandwidth 1.0.  That is the §11.5/§11.5a
+pair, found and fixed in `ph2d.py` in session 7 and **never ported to 3D**.
+Measured on `DESC/aniso3d`, direction [1,0,0], per 100-column block:
+
+| block | numerical rank | top-1 variance |
+|---|---|---|
+| H0 | 25/100 | **.9960** |
+| H1 | 20/100 | **.9991** |
+| H2 | 17/100 | **.9997** |
+
+One effective degree of freedom each.  Every recorded 3D `ph` and `tda` number
+rests on that.
+
+There is a **third defect, specific to H2** and independent of the bandwidth.
+Cone H2 persistence measures p50 0.006, p99 0.023, max 0.043 — and it was
+imaged over p[0,1.25].  At resolution 10 a pixel is 0.125 wide, so **every H2
+bar in the dataset landed in the first pixel row**.  H2 is the dimension
+NOTES 10.3 predicted would make PH worth computing in 3D; it had never actually
+been resolved.
+
+`ph3d.py` now takes `--weight`, `--bandwidth`, per-dimension `--im_range_h{0,1,2}`
+and `--bandwidth_h{0,1,2}`, and prints the px ratios with a `SMEARED` flag, as
+`ph2d.py` does.  `run_cone_redo3d.sh` rebuilds the cone PH with H0 at
+b[0,1.25] p[0,1.25] bw 0.125, H1 at p[0,0.80] bw 0.100, and H2 on its own
+window b[0.2,1.0] p[0,0.06] bw 0.019.  After the fix, the same blocks measure
+rank **90/93/71** with top-1 variance **.4955/.6227/.9356**.
+
+### 12.3 Results — all six tensor components, n=2816, 5 folds, seed 0
+
+`tpc`, `baselines` and `ecp` were re-run inside the new calls and reproduce
+their recorded values **to four decimals, fold for fold**, which is what makes
+the paired tests below valid.  (`ecp` is the strongest control: it is symlinked
+from `DESC/aniso3d/ecp` and untouched by PH imaging, so it *must* be identical.)
+
+| set | group | feat | k_xy | k_xz | k_yz | K_xx | K_yy | K_zz |
+|---|---|---|---|---|---|---|---|---|
+| rec | `tpc` | 369 | .7437 | .7374 | .7504 | .9632 | .9619 | .9621 |
+| rec | `baselines` | 1819 | .7653 | .7598 | .7809 | .9587 | .9582 | .9589 |
+| rec | `ph` | 2700 | .6135 | .6025 | .6250 | .9068 | .9111 | .9081 |
+| rec | `ecp` | 3087 | .7326 | .7434 | .7761 | .9502 | .9539 | .9496 |
+| rec | `tda` | 5787 | .7373 | .7418 | .7677 | .9656 | .9679 | .9632 |
+| rec | `all` | 7606 | .7846 | .7928 | .8078 | .9805 | .9826 | .9792 |
+| fixed | `ph` | 2700 | .6696 | .6428 | .6821 | .9533 | .9553 | .9550 |
+| fixed | `tda` | 5787 | .7513 | .7577 | .7816 | .9637 | .9660 | .9634 |
+| fixed | `all` | 7606 | .7870 | .7983 | .8129 | .9777 | .9770 | .9780 |
+| **throat** | **`thr`** | 2700 | **.8081** | **.8033** | **.8304** | **.9845** | **.9836** | **.9864** |
+| throat | `tpc+thr` | 3069 | .8140 | .8170 | .8379 | **.9891** | .9868 | **.9900** |
+| throat | `baselines+thr` | 4519 | **.8202** | .8168 | .8369 | .9881 | **.9878** | .9899 |
+
+**`thr` beats `baselines` on all six components, winning all 30 folds:**
+
+| target | delta | folds | p |
+|---|---|---|---|
+| k_xy | +.0428 | 5/5 | .016 |
+| k_xz | +.0436 | 5/5 | .014 |
+| k_yz | +.0495 | 5/5 | .008 |
+| K_xx | +.0258 | 5/5 | .002 |
+| K_yy | +.0254 | 5/5 | .002 |
+| K_zz | +.0275 | 5/5 | .0006 |
+
+2700 features beating 1819.  It also beats the recorded `all` and the re-imaged
+`all` — 7606 features — on all six, using no baselines at all.
+
+### 12.4 The decomposition: representation vs filtration function
+
+Both effects are real and they are **separable**, which is the part worth
+keeping.
+
+**The imaging fix** (same cone filtration, correct images) bought `ph`
++.056/+.040/+.057 off-diagonal and +.047/+.044/+.047 diagonal — and then washed
+out: `tda` gained only +.014/+.016/+.014, and `all` moved +.002/+.006/+.005
+off-diagonal and *negative* on the diagonals.  The same dilution pattern as
+every 2D descriptor fix (§11.12 and the ceiling entry).
+
+**The filtration function** is the larger effect.  Against the *properly
+imaged* cone `tda`, `thr` gains **+.057/+.046/+.049** off-diagonal and
++.021/+.018/+.023 diagonal, 5/5 folds throughout.  So the representation was
+broken, repairing it matters for `ph` alone, and what actually moves the result
+is measuring **throat radius instead of occupancy**.
+
+### 12.5 What this does to the study's claim
+
+The 2D conclusion does not transfer, and the difference is the one predicted
+from first principles: **in 2D the pore and solid phases cannot both percolate**
+(planar duality), so connectivity is geometrically constrained; in 3D both can,
+so connectivity genuinely varies and a descriptor that measures throat radii
+has something to measure.
+
+| | 2D (k_off) | 3D (off-diagonal mean) |
+|---|---|---|
+| best previous TDA vs `baselines` | -.060 | -.020 |
+| `thr` vs `baselines` | **-.008 (a draw, p=.57)** | **+.045, 6/6 targets** |
+| did anything beat `all`? | no, 5 interventions, ceiling .754 | **yes, `baselines+thr`, p<=.014** |
+
+So "TDA loses to baselines" is a **2D-only** result, and it rested partly on a
+broken representation.  It does not survive in 3D with the right filtration.
+
+**Two qualifiers the claim must carry.**
+
+1. "TDA" here means the **throat** descriptor, not this study's directional
+   cone descriptors.  Even after re-imaging, `tda` still goes .7513/.7577/.7816
+   against `baselines` .7653/.7598/.7809 — a loss, a loss and a tie.  Writing
+   "directional TDA beats baselines in 3D" would be false.
+2. **The CNN still dominates.**  `cnn3d_densenet121` on the same 2816 rows:
+   .9582/.9405/.9635 off-diagonal and .9959/.9956/.9957 diagonal, against
+   `thr`'s .808/.803/.830 and .985/.984/.986.  That is +.15 on the
+   off-diagonals.  The defensible sentence is *"among interpretable
+   descriptors, throat-scale PH is the best predictor of the 3D permeability
+   tensor, beating every non-topological baseline on every component; a CNN on
+   raw voxels still outperforms every descriptor by a wide margin."*
+
+### 12.6 Two questions answered, for the record
+
+**Is `thr` directional in the same sense as the cone?**  Yes.  Built per
+direction, same nine directions, same tag scheme, same collector.  The
+direction genuinely changes the values: matched features across direction
+blocks correlate at median |r| = **0.75-0.81**, not 1.0, and the signed pair
+[1,1,0] vs [1,-1,0] — the contrast carrying the *sign* of k_xy — differs by a
+mean |z-difference| of 0.375.  Rotation equivariance is self-tested exactly.
+It is **axis-**directional, not signed: the walk goes both ±d and takes a
+minimum, so d and -d give identical values, exactly as for the cone and wedge.
+
+**Which phase do the baselines use?**  All of them use the **solid** phase:
+`porosity_profile(solid,...)`, `two_point_correlation(solid,...)` (with a
+self-test asserting S2(0) = solid fraction), and both fabric features from
+`_interface_normals(solid)`.  `thr` uses the void phase.  **That is not a
+confound**: slab solid fraction is 1 - slab void fraction; for a two-phase
+medium S2_void(r) = 1 - 2*phi_s + S2_solid(r); and the interface normals are
+shared between phases up to sign.  The baselines are phase-invariant in
+content.  The TDA descriptors are *not* (§11.8), and the throat descriptor is
+intrinsically a void object — the inscribed radius of the pore space is the
+throat, and there is no solid-phase reading of it that means anything for flow.
+
+### 12.7 On disk
+
+`scripts/filtration_throat3d.py`, `run_throat3d.sh`, `run_cone_redo3d.sh`,
+`train3d_throat.sh`, `run3d_all.sh`;
+`DESC/aniso3d_throat/descriptors.csv` (2816 x 2700),
+`DESC/aniso3d_throat_iso/descriptors.csv` (2816 x 300, **never trained** — see
+RESUME.md), `DESC/aniso3d_ph_fixed/descriptors.csv` (2816 x 5787);
+`RESULTS/aniso3d_throat/{k_xy,k_xz,k_yz,K_xx,K_yy,K_zz}/`,
+`RESULTS/aniso3d_conefixed/` likewise; logs `THROAT3D_DESC.log`,
+`RUN3D_ALL.log`, `RUN3D_ALL2.log`.
+
+The per-structure `.npy` trees live on scratch and **do not survive the
+machine**; `descriptors.csv` is the durable artefact.
+
+### 12.8 Two operational bugs worth not repeating
+
+**The binding quota is inodes, not bytes.**  /home carries
+`ceph.quota.max_files = 1,000,000` alongside the 150 GiB byte cap, and the
+descriptor pipeline writes one `.npy` per structure per direction.  Writes
+began failing with `Errno 122` while **23 GiB of bytes were still free**.  The
+fix is structural: intermediates and per-structure outputs go to /tmp (a
+separate 99 GB disk, no inode cap) and only `descriptors.csv` lands under
+/home — one inode instead of 28,160.
+
+    getfattr -n ceph.quota.max_bytes ~ ; getfattr -n ceph.quota.max_files ~
+    getfattr -n ceph.dir.rbytes      ~ ; getfattr -n ceph.dir.rentries   ~
+
+**`python ... | tee log` hides a crash from `set -e`.**  A pipeline's status is
+the last command's, and `tee` always succeeds, so a crashed PH stage passed as
+success and the driver marched on through two more directions with one
+direction silently incomplete.  Fixed with `set -eo pipefail` in
+`run_throat3d.sh`, `run_cone_redo3d.sh`, `run_descriptors3d.sh` and
+`run_throat.sh`.
+
+**But `pipefail` then breaks `ls DIR 2>/dev/null | wc -l`** — `ls` on a
+not-yet-existing directory exits non-zero, pipefail propagates it past the
+successful `wc`, and `set -e` kills the script **with no message**, ls's stderr
+having gone to /dev/null.  That is how stage 2 died silently on 2026-09-18.
+All three resume checks now use an explicit `[ -d ... ]` guard.  If you add
+`pipefail` to any other driver, audit its count pipelines first.
