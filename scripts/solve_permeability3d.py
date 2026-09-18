@@ -57,23 +57,68 @@ DEFAULT_SOLVER = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "LMB3d", "lbm3d-perm")
 
 
+# Columns every finished per-sample CSV must carry. Checked rather than assumed,
+# because "the file exists and is non-empty" is NOT the same as "the solve
+# finished" -- see valid_result().
+REQUIRED_COLS = ("K_xx", "K_yy", "K_zz", "k_xy", "k_xz", "k_yz",
+                 "conv_fx", "conv_fy", "conv_fz")
+
+
+def valid_result(path) -> bool:
+    """
+    True if `path` holds a COMPLETE solve, not merely a non-empty file.
+
+    The old cache test was `exists and size > 0`, which is wrong the moment a
+    run is killed: the solver writes its CSV in place, so a kill between the
+    header line and the data line leaves a non-empty file that the next run
+    happily skips, and the sample is then silently absent from the merge
+    forever. This parses the file and insists on one data row with the tensor
+    columns present. Cheap -- these files are ~1.1 kB.
+    """
+    try:
+        if os.path.getsize(path) <= 0:
+            return False
+        one = pd.read_csv(path)
+    except Exception:
+        return False
+    if len(one) < 1 or not set(REQUIRED_COLS) <= set(one.columns):
+        return False
+    return bool(np.isfinite(one[list(REQUIRED_COLS)].to_numpy(float)).all())
+
+
 def solve_one(task):
     solver, structure, out_csv, ff, timeout, extra = task
-    if os.path.exists(out_csv) and os.path.getsize(out_csv) > 0:
-        return out_csv, 0, "cached"
+    if os.path.exists(out_csv):
+        if valid_result(out_csv):
+            return out_csv, 0, "cached"
+        # Present but incomplete: a killed run. Redo it rather than inherit it.
+        os.remove(out_csv)
 
-    cmd = [solver, structure, out_csv, "--quiet", "--ff", str(ff)] + extra
+    # Write to a temp path and rename on success. os.replace is atomic within a
+    # filesystem, so the final path only ever holds a complete solve and a kill
+    # at any instant leaves at most a stray .tmp file. This is what makes the
+    # run resumable across an interrupted multi-day campaign.
+    tmp = f"{out_csv}.tmp.{os.getpid()}"
+    cmd = [solver, structure, tmp, "--quiet", "--ff", str(ff)] + extra
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        if os.path.exists(out_csv):
-            os.remove(out_csv)
+        if os.path.exists(tmp):
+            os.remove(tmp)
         return out_csv, -1, "timeout"
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
-    if p.returncode not in (0, 3):
-        if os.path.exists(out_csv):
-            os.remove(out_csv)
-        return out_csv, p.returncode, (p.stderr or "").strip()[-200:]
+    if p.returncode not in (0, 3) or not valid_result(tmp):
+        msg = (p.stderr or "").strip()[-200:] if p.returncode not in (0, 3) \
+            else "solver returned 0/3 but wrote an incomplete CSV"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return out_csv, p.returncode or -2, msg
+
+    os.replace(tmp, out_csv)          # atomic
     return out_csv, p.returncode, "ok"
 
 
@@ -89,6 +134,12 @@ def main():
     ap.add_argument("--timeout", type=int, default=86400,
                     help="per-structure wall-clock limit in seconds (default 24 h)")
     ap.add_argument("--merge-only", action="store_true")
+    ap.add_argument("--verify", action="store_true",
+                    help="audit <dataset>/perm/ and report how many solves are "
+                         "complete, incomplete or missing, then exit")
+    ap.add_argument("--repair", action="store_true",
+                    help="with --verify, delete incomplete per-sample CSVs (and "
+                         "any stray .tmp files) so the next run redoes them")
     ap.add_argument("--extra", default="",
                     help='extra flags for the solver, e.g. "--eps 5e-4"')
     args = ap.parse_args()
@@ -104,6 +155,30 @@ def main():
     os.makedirs(perm_dir, exist_ok=True)
     structures_dir = os.path.join(args.dataset, "structures")
 
+    expected = [(r.sample_id, os.path.join(perm_dir, f"{r.sample_id:06d}.csv"))
+                for r in df.itertuples()]
+
+    if args.verify:
+        good = [sid for sid, pth in expected if os.path.exists(pth) and valid_result(pth)]
+        bad = [sid for sid, pth in expected if os.path.exists(pth) and not valid_result(pth)]
+        missing = [sid for sid, pth in expected if not os.path.exists(pth)]
+        strays = [f for f in os.listdir(perm_dir) if ".tmp." in f]
+        print(f"{args.dataset}: {len(expected)} structures")
+        print(f"  complete   {len(good)}")
+        print(f"  incomplete {len(bad)}" + (f"  e.g. {bad[:5]}" if bad else ""))
+        print(f"  missing    {len(missing)}"
+              + (f"  first {missing[:3]} ... last {missing[-3:]}" if missing else ""))
+        print(f"  stray .tmp {len(strays)}")
+        if args.repair:
+            for sid in bad:
+                os.remove(os.path.join(perm_dir, f"{sid:06d}.csv"))
+            for f in strays:
+                os.remove(os.path.join(perm_dir, f))
+            print(f"  repaired: removed {len(bad)} incomplete + {len(strays)} stray files")
+        elif bad or strays:
+            print("  rerun with --repair to clear them, then resume normally")
+        return
+
     if not args.merge_only:
         if not os.path.exists(args.solver):
             sys.exit(f"solver not found: {args.solver}  (build it with LMB3d/make_perm.sh)")
@@ -114,6 +189,13 @@ def main():
                   os.path.join(perm_dir, f"{r.sample_id:06d}.csv"),
                   args.ff, args.timeout, extra)
                  for r in df.itertuples()]
+
+        todo = sum(1 for _, pth in expected
+                   if not (os.path.exists(pth) and valid_result(pth)))
+        print(f"{len(expected)} structures: {len(expected) - todo} already solved, "
+              f"{todo} to do")
+        if todo == 0:
+            print("nothing to solve -- merging what is on disk")
 
         failed, unconverged, cached = [], 0, 0
         with ProcessPoolExecutor(max_workers=args.workers) as pool:
@@ -133,16 +215,23 @@ def main():
             print(f"  {name}: rc={rc} {msg}")
 
     # --- merge --------------------------------------------------------------
-    parts = []
+    parts, unreadable = [], []
     for r in df.itertuples():
         pth = os.path.join(perm_dir, f"{r.sample_id:06d}.csv")
-        if os.path.exists(pth) and os.path.getsize(pth) > 0:
-            try:
-                one = pd.read_csv(pth)
-            except Exception:
-                continue
-            one["sample_id"] = r.sample_id
-            parts.append(one)
+        if not os.path.exists(pth):
+            continue
+        if not valid_result(pth):
+            # Previously a bare `continue`, which dropped a damaged sample from
+            # the merge with no trace. Say so instead.
+            unreadable.append(r.sample_id)
+            continue
+        one = pd.read_csv(pth)
+        one["sample_id"] = r.sample_id
+        parts.append(one)
+    if unreadable:
+        print(f"WARNING: {len(unreadable)} per-sample CSVs are incomplete and were "
+              f"skipped (e.g. {unreadable[:5]}).")
+        print("         Run with --verify --repair, then resume, to redo them.")
 
     if not parts:
         sys.exit("nothing to merge")
