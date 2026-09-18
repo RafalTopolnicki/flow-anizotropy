@@ -10,9 +10,33 @@ flagged, not treated as a failure.
 
 Restartability matters more here than in 2D: this run is days rather than hours.
 
+Kill-safety (2026-09-18)
+------------------------
+"Restartable" originally meant `exists and size > 0` skips a sample. That is
+not enough for a run that gets killed: the solver wrote its CSV *in place*, so
+a kill between the header line and the data line left a non-empty file that the
+next run skipped forever, and the sample vanished from the merge with no trace.
+Two changes close it:
+
+  * the solver now writes to `<out>.tmp.<pid>` and the driver `os.replace()`s it
+    into place only after checking the result -- `os.replace` is atomic within a
+    filesystem, so the final path only ever holds a COMPLETE solve, and a kill
+    at any instant leaves at most a stray `.tmp` file;
+  * the cache test is `valid_result()` -- parses the CSV and requires one data
+    row with finite K_xx..k_yz and the three convergence flags -- so an
+    incomplete file left by an older run is redone rather than inherited.
+
+The merge now reports incomplete files instead of silently dropping them.
+
 Usage
 -----
+    # audit first -- how many are done, incomplete, missing
+    python scripts/solve_permeability3d.py --dataset DATA/aniso3d --verify
+    # clear anything a kill left half-written, then resume
+    python scripts/solve_permeability3d.py --dataset DATA/aniso3d --verify --repair
+    # resume: solves only what is missing, safe to run repeatedly
     python scripts/solve_permeability3d.py --dataset DATA/aniso3d --workers 14
+    # rebuild permeability.csv from whatever is on disk, solving nothing
     python scripts/solve_permeability3d.py --dataset DATA/aniso3d --merge-only
 
 Derived targets

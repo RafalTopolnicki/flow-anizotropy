@@ -16,12 +16,17 @@ conversations/*.jsonl
 # Papers (third-party PDFs)
 papers/
 
-# Build artefacts
+# Build artefacts. The compiled solvers are rebuilt from source with
+# LMB2d/make_perm.sh and LMB3d/make_perm.sh; they were tracked until
+# 2026-09-18 and were untracked with `git rm --cached` (the files stay on
+# disk). Listing a path here does NOT untrack it -- .gitignore only applies to
+# files git is not already following.
 LMB2d/lbm2d-perm
 LMB2d/lbm2d-perm-gl
 LMB2d/lbm2d-250x250
 LMB2d/lbm2d-256x256
 LMB2d/lbm2d-256x256_force
+LMB3d/lbm3d-perm
 *.o
 
 # Python
