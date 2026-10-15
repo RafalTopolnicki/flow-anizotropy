@@ -151,6 +151,7 @@ static vector<double>  f0, f1;                 // NN*Q
 static vector<double>  U, V, W, RHO;           // NN
 static double Fx, Fy, Fz;
 static long   n_pore;
+static bool   primed = false;                  // f0 holds post-collision values
 
 static inline long idx(int x, int y, int z) { return (long(z)*NY + y)*NX + x; }
 
@@ -207,76 +208,91 @@ static void reset_distributions()
     fill(V.begin(), V.end(), 0.0);
     fill(W.begin(), W.end(), 0.0);
     fill(RHO.begin(), RHO.end(), 1.0);
+    primed = false;
 }
 
-static void macro_collide()
+// Macroscopic moments + BGK collision with Guo forcing for one fluid node:
+// reads the pre-collision distributions g, writes the post-collision ones to out
+// (g == out is allowed).  U,V,W are never written at solid nodes, so they stay
+// exactly 0 there.
+static inline void collide_node(long i, const double *g, double *out)
 {
-    for(long i = 0; i < NN; i++)
+    double r = 0, ux = 0, uy = 0, uz = 0;
+    for(int k = 0; k < Q; k++)
     {
-        if(solid[i]) continue;                 // U,V,W stay exactly 0 in solid
-        double *f = &f0[i*Q];
-        double r = 0, ux = 0, uy = 0, uz = 0;
-        for(int k = 0; k < Q; k++)
-        {
-            r += f[k];
-            ux += f[k]*ex[k]; uy += f[k]*ey[k]; uz += f[k]*ez[k];
-        }
-        // Guo forcing: the physical velocity carries half the body force.
-        // Macro and collision are fused into this one pass: both are node-local
-        // on f0, so splitting them cost a second full sweep of an array far
-        // larger than cache for no benefit.
-        RHO[i] = r;
-        ux = U[i] = (ux + 0.5*Fx)/r;
-        uy = V[i] = (uy + 0.5*Fy)/r;
-        uz = W[i] = (uz + 0.5*Fz)/r;
+        r += g[k];
+        ux += g[k]*ex[k]; uy += g[k]*ey[k]; uz += g[k]*ez[k];
+    }
+    // Guo forcing: the physical velocity carries half the body force.
+    RHO[i] = r;
+    ux = U[i] = (ux + 0.5*Fx)/r;
+    uy = V[i] = (uy + 0.5*Fy)/r;
+    uz = W[i] = (uz + 0.5*Fz)/r;
 
-        const double u2 = ux*ux + uy*uy + uz*uz;
-        const double pref = 1.0 - 0.5/TAU;
-        for(int k = 0; k < Q; k++)
-        {
-            const double eu = ex[k]*ux + ey[k]*uy + ez[k]*uz;
-            const double feq = wq[k]*r*(1.0 + 3.0*eu + 4.5*eu*eu - 1.5*u2);
-            // Guo et al. (2002) source term, with cs^2 = 1/3:
-            //   S_k = w_k (1 - 1/2tau) [ 3(e_k - u) + 9(e_k.u) e_k ] . F
-            const double sk = wq[k] * pref *
-                ( 3.0*((ex[k]-ux)*Fx + (ey[k]-uy)*Fy + (ez[k]-uz)*Fz)
-                + 9.0*eu*(ex[k]*Fx + ey[k]*Fy + ez[k]*Fz) );
-            f[k] += (feq - f[k]) / TAU + sk;
-        }
+    const double u2 = ux*ux + uy*uy + uz*uz;
+    const double pref = 1.0 - 0.5/TAU;
+    for(int k = 0; k < Q; k++)
+    {
+        const double eu = ex[k]*ux + ey[k]*uy + ez[k]*uz;
+        const double feq = wq[k]*r*(1.0 + 3.0*eu + 4.5*eu*eu - 1.5*u2);
+        // Guo et al. (2002) source term, with cs^2 = 1/3:
+        //   S_k = w_k (1 - 1/2tau) [ 3(e_k - u) + 9(e_k.u) e_k ] . F
+        const double sk = wq[k] * pref *
+            ( 3.0*((ex[k]-ux)*Fx + (ey[k]-uy)*Fy + (ez[k]-uz)*Fz)
+            + 9.0*eu*(ex[k]*Fx + ey[k]*Fy + ez[k]*Fz) );
+        out[k] = g[k] + ((feq - g[k]) / TAU + sk);
     }
 }
 
+// Collision alone, in place on f0.  Used once per solve, to turn the initial
+// (pre-collision) state into the post-collision state the fused step expects.
+static void collide_only()
+{
+    for(long i = 0; i < NN; i++)
+        if(!solid[i]) collide_node(i, &f0[i*Q], &f0[i*Q]);
+}
+
+// One fused step: stream (pull) then collide, f0 -> f1, fluid nodes only.
+//
 // Halfway bounce-back on links, periodic in all three axes, as a *pull*:
 //
-//     p = i - e_k ;  f1[i][k] = solid[p] ? f0[i][opp[k]] : f0[p][k]
+//     p = i - e_k ;  g[k] = solid[p] ? f0[i][opp[k]] : f0[p][k]
 //
-// which is exactly equivalent to the push form (a push writes f1[i][k] either
-// from the node at i - e_k streaming along k, or from node i itself bouncing
-// direction opp[k] back when i - e_k is solid).  Pull is worth the rewrite:
-// every entry of f1 is written exactly once, so the full 78 MB memset the push
-// form needed each step disappears, and the writes become contiguous instead of
-// scattered.
-static void stream()
+// then g is collided straight into f1[i].  f0 holds POST-collision values, so
+// one step reads the big array once and writes it once; the earlier separate
+// collide pass + stream pass swept it twice per step.  Solid nodes are skipped
+// entirely: their distributions are never read (a pull from a solid p takes the
+// bounce-back branch instead), so they need neither collision nor zeroing.
+//
+// The sequence of states is the same as collide(); stream(); per step: solve()
+// primes with collide_only() as its first step, after which step s computes
+// U,V,W from exactly the same pre-collision state the old step s did.
+static void stream_collide()
 {
+    double g[Q];
     for(int z = 0; z < NZ; z++)
     for(int y = 0; y < NY; y++)
     for(int x = 0; x < NX; x++)
     {
         const long i = idx(x, y, z);
-        double *dst = &f1[i*Q];
-        if(solid[i]) { for(int k = 0; k < Q; k++) dst[k] = 0.0; continue; }
+        if(solid[i]) continue;
         for(int k = 0; k < Q; k++)
         {
             const long p = idx(pmx[size_t(k)*NX + x],
                                pmy[size_t(k)*NY + y],
                                pmz[size_t(k)*NZ + z]);
-            dst[k] = solid[p] ? f0[i*Q + opp[k]] : f0[p*Q + k];
+            g[k] = solid[p] ? f0[i*Q + opp[k]] : f0[p*Q + k];
         }
+        collide_node(i, g, &f1[i*Q]);
     }
     f0.swap(f1);
 }
 
-static void lbm_step() { macro_collide(); stream(); }
+static void lbm_step()
+{
+    if(!primed) { collide_only(); primed = true; }
+    else          stream_collide();
+}
 
 // q_i = mean(u_i) over the whole cell — the Darcy superficial velocity.
 static void volumeavg(double q[3])
