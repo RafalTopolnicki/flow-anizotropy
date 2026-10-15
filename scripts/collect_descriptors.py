@@ -80,17 +80,32 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--kinds", nargs="+", default=["ecp", "ph"])
     p.add_argument("--limit", type=int, default=0,
-                   help="collect only the first N structures. Needed when the "
-                        "descriptors were computed for a labelled prefix of the "
-                        "dataset rather than all of it -- DATA/aniso3d has 5000 "
-                        "structures and 2816 contiguous labels, so descriptors "
-                        "built with --limit 2816 would otherwise trip the "
-                        "missing-descriptor check below.")
+                   help="stop at structure N (exclusive). Needed when the "
+                        "descriptors were computed for a prefix of the dataset "
+                        "rather than all of it -- DATA/aniso3d has 5000 "
+                        "structures, and descriptors built with --limit 2816 "
+                        "would otherwise trip the missing-descriptor check.")
+    p.add_argument("--start", type=int, default=0,
+                   help="begin at structure N (inclusive), so [--start, --limit) "
+                        "is collected. For EXTENDING a table: the .npy tree for "
+                        "an earlier prefix is an intermediate and is routinely "
+                        "deleted once folded into the CSV, so a later run holds "
+                        "only the tail and the missing-descriptor check below "
+                        "would fire on the head that is already in the CSV. "
+                        "Collect the tail into its own part file and join the "
+                        "parts with merge_descriptors.py, which checks the seam.")
     a = p.parse_args()
 
     base = pd.read_csv(os.path.join(a.dataset, "structures.csv")).set_index("sample_id")
-    if a.limit:
-        base = base.iloc[:a.limit]
+    # iloc, not loc: `--start`/`--limit` are ROW offsets into structures.csv, the
+    # same offsets filtration_throat3d.py and filtration3d.py slice with, so the
+    # three stages agree even if sample_id were ever not equal to row number.
+    if a.start or a.limit:
+        base = base.iloc[a.start:(a.limit or None)]
+        if base.empty:
+            sys.exit(f"--start {a.start} --limit {a.limit} selects no structures")
+        print(f"  collecting structures [{a.start}, {a.limit or 'end'}) "
+              f"-> {len(base)} rows")
     out = base[["filename", "stratum", "porosity"]].copy()
 
     total = 0

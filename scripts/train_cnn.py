@@ -114,8 +114,20 @@ def run_fold(X, Y, tr, te, args, targets):
     dev = torch.device(args.device)
     rng = np.random.default_rng(args.seed)
 
-    mu, sd = Y[tr].mean(0), Y[tr].std(0)
-    sd[sd == 0] = 1.0
+    # Per-target standardisation, fitted on the TRAIN fold only -- the test
+    # rows never enter mu/sd, so no label information crosses the split. The
+    # network is trained on Yn and its predictions are mapped back to raw units
+    # at the end of this function, so every metric stays comparable with the
+    # CatBoost runs. On by default: with one shared MSE head over targets whose
+    # variances differ by ~18x (k_xx vs k_off in 2D), the high-variance
+    # component would otherwise dominate the gradient. --no-scale-targets
+    # disables it, which is a diagnostic, not a configuration worth running.
+    if args.scale_targets:
+        mu, sd = Y[tr].mean(0), Y[tr].std(0)
+        sd[sd == 0] = 1.0
+    else:
+        mu = np.zeros(Y.shape[1])
+        sd = np.ones(Y.shape[1])
 
     try:
         model = timm.create_model(args.backbone, pretrained=args.pretrained,
@@ -242,6 +254,14 @@ def main():
     p.add_argument("--output")
     p.add_argument("--backbone", default="convnext_tiny")
     p.add_argument("--targets", nargs="+", default=["tensor", "invariant"])
+    p.add_argument("--no-scale-targets", dest="scale_targets",
+                   action="store_false", default=True,
+                   help="do NOT standardise the targets before training. "
+                        "Standardisation is on by default and always has been "
+                        "(train-fold statistics only, inverted before scoring); "
+                        "this flag exists to measure what it is worth, and "
+                        "disabling it is expected to hurt the low-variance "
+                        "components.")
     p.add_argument("--augment", choices=["none", "roll", "roll+d4"], default="roll")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch", type=int, default=32)

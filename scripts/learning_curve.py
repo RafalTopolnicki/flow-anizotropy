@@ -210,6 +210,18 @@ def main():
             d = d.merge(pd.read_csv(f), on="sample_id", how="left",
                         suffixes=("", "_dup"))
         feat = d
+        # The merge is a LEFT join, so a structure missing from a descriptor
+        # table comes back as a row of NaN -- which CatBoost accepts without a
+        # word and turns into a quietly worse R^2. Every row this run can touch
+        # (golden + pool) must have every feature of every requested group.
+        need = sorted({c for g in a.groups for c in select(feat, g)})
+        used = feat[feat.sample_id.isin(np.concatenate([golden, pool]))]
+        bad = used[need].isna().any(axis=1)
+        if bad.any():
+            raise SystemExit(f"{int(bad.sum())} structures lack descriptors "
+                             f"(first ids {used.sample_id[bad].head().tolist()}); "
+                             "rebuild the descriptor tables before training.")
+        feat = feat.set_index("sample_id")
         print(f"model: CatBoost  early_stop={a.early_stop}  "
               f"iterations={a.iterations}  pca={a.pca or 'off'}")
 
@@ -252,7 +264,7 @@ def main():
                         pred = np.asarray(pred).reshape(len(golden), -1)[:, 0]
                         ytrue = ytrue[:, 0]
                     else:
-                        sub = feat.set_index("sample_id")
+                        sub = feat
                         Xtr = sub.loc[train_ids, cols].to_numpy(np.float32)
                         Xte = sub.loc[golden, cols].to_numpy(np.float32)
                         yi = df.set_index("sample_id")[target]
@@ -296,6 +308,7 @@ def main():
 
     with open(os.path.join(a.output, "metrics.json"), "w") as fh:
         json.dump({"split": a.split if not a.no_golden else None,
+                   "descriptors": None if a.cnn else a.descriptors,
                    "n_golden": int(len(golden)), "n_pool": int(len(pool)),
                    "sizes": sizes, "seeds": a.seeds, "targets": targets,
                    "groups": groups, "early_stop": bool(a.early_stop),

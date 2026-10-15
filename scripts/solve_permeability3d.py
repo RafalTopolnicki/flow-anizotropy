@@ -158,6 +158,14 @@ def main():
     ap.add_argument("--timeout", type=int, default=86400,
                     help="per-structure wall-clock limit in seconds (default 24 h)")
     ap.add_argument("--merge-only", action="store_true")
+    ap.add_argument("--shard", default="",
+                    help="I/N: solve/verify only samples with sample_id %% N == I, and "
+                         "do NOT merge (other shards may still be running); split a run "
+                         "over N machines, then --merge-only once all are done")
+    ap.add_argument("--interleave", default="",
+                    help="solve order round-robin over this structures.csv column "
+                         "(e.g. rock), so a run cut short still covers every group; "
+                         "labels and permeability.csv row order are unaffected")
     ap.add_argument("--verify", action="store_true",
                     help="audit <dataset>/perm/ and report how many solves are "
                          "complete, incomplete or missing, then exit")
@@ -174,6 +182,15 @@ def main():
     df = pd.read_csv(struct_csv)
     if args.limit:
         df = df.head(args.limit)
+    shard_ids = None
+    if args.shard:
+        if args.merge_only:
+            sys.exit("--shard and --merge-only exclude each other: merge runs over all shards")
+        si, sn = (int(v) for v in args.shard.split("/"))
+        assert 0 <= si < sn, f"bad --shard {args.shard}"
+        df = df[df.sample_id % sn == si].reset_index(drop=True)
+        shard_ids = set(df.sample_id)
+        print(f"shard {si}/{sn}: {len(df)} samples")
 
     perm_dir = os.path.join(args.dataset, "perm")
     os.makedirs(perm_dir, exist_ok=True)
@@ -187,6 +204,9 @@ def main():
         bad = [sid for sid, pth in expected if os.path.exists(pth) and not valid_result(pth)]
         missing = [sid for sid, pth in expected if not os.path.exists(pth)]
         strays = [f for f in os.listdir(perm_dir) if ".tmp." in f]
+        if shard_ids is not None:
+            # never touch another shard's in-flight temp files on a shared disk
+            strays = [f for f in strays if int(f.split(".")[0]) in shard_ids]
         print(f"{args.dataset}: {len(expected)} structures")
         print(f"  complete   {len(good)}")
         print(f"  incomplete {len(bad)}" + (f"  e.g. {bad[:5]}" if bad else ""))
@@ -208,11 +228,16 @@ def main():
             sys.exit(f"solver not found: {args.solver}  (build it with LMB3d/make_perm.sh)")
 
         extra = args.extra.split()
+        order = df
+        if args.interleave:
+            # i-th cube of every group before the (i+1)-th of any; stable within a group
+            rank = df.groupby(args.interleave, sort=False).cumcount()
+            order = df.assign(_r=rank).sort_values(["_r", args.interleave], kind="stable")
         tasks = [(args.solver,
                   os.path.join(structures_dir, r.filename),
                   os.path.join(perm_dir, f"{r.sample_id:06d}.csv"),
                   args.ff, args.timeout, extra)
-                 for r in df.itertuples()]
+                 for r in order.itertuples()]
 
         todo = sum(1 for _, pth in expected
                    if not (os.path.exists(pth) and valid_result(pth)))
@@ -237,6 +262,9 @@ def main():
               f"failed {len(failed)}")
         for name, rc, msg in failed[:10]:
             print(f"  {name}: rc={rc} {msg}")
+        if shard_ids is not None:
+            print("shard finished -- not merging; run --merge-only once every shard is done")
+            return
 
     # --- merge --------------------------------------------------------------
     parts, unreadable = [], []

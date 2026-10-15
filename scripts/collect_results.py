@@ -21,7 +21,6 @@ recovering the generator's orientation, before any labels existed).
 """
 
 import argparse
-import glob
 import os
 import sys
 
@@ -29,13 +28,35 @@ import pandas as pd
 
 # TDA first, then baselines, then the nulls — so the printed table reads in the
 # order the argument is made rather than alphabetically.
-GROUP_ORDER = ["tda", "ecp", "ph", "all", "baselines", "fab", "fabdir",
+GROUP_ORDER = ["tda", "ecp", "ph", "thr", "all", "baselines", "fab", "fabdir",
                "tpc", "por", "porosity"]
+
+
+def find_results(results):
+    """Every `results.csv` under `--results`, at whatever depth.
+
+    The 2D grid writes `RESULTS/<kind>/<run>/results.csv`, but the 3D runs nest
+    one level deeper (`RESULTS/aniso3d/catboost/<target>/results.csv`), so a
+    fixed two-level glob silently dropped every 3D row from the summary.  Walk
+    instead: `kind` is the first component under `--results`, `run` is whatever
+    is left, so the 2D paths keep exactly the labels they had.
+    """
+    out = []
+    for dirpath, _dirnames, filenames in os.walk(results):
+        if "results.csv" not in filenames:
+            continue
+        rel = os.path.relpath(dirpath, results)
+        parts = rel.split(os.sep)
+        if len(parts) < 2:          # a stray results.csv directly under RESULTS
+            continue
+        out.append((os.path.join(dirpath, "results.csv"), parts[0],
+                    "/".join(parts[1:])))
+    return sorted(out)
 
 
 def load(results):
     rows = []
-    for f in sorted(glob.glob(os.path.join(results, "*", "*", "results.csv"))):
+    for f, kind, run in find_results(results):
         try:
             d = pd.read_csv(f)
         except Exception as e:
@@ -43,8 +64,8 @@ def load(results):
             continue
         if d.empty:
             continue
-        d["run"] = os.path.basename(os.path.dirname(f))
-        d["kind"] = os.path.basename(os.path.dirname(os.path.dirname(f)))
+        d["run"] = run
+        d["kind"] = kind
         rows.append(d)
     if not rows:
         return None

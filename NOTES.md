@@ -2897,8 +2897,8 @@ throat, and there is no solid-phase reading of it that means anything for flow.
 `scripts/filtration_throat3d.py`, `run_throat3d.sh`, `run_cone_redo3d.sh`,
 `train3d_throat.sh`, `run3d_all.sh`;
 `DESC/aniso3d_throat/descriptors.csv` (2816 x 2700),
-`DESC/aniso3d_throat_iso/descriptors.csv` (2816 x 300, **never trained** — see
-RESUME.md), `DESC/aniso3d_ph_fixed/descriptors.csv` (2816 x 5787);
+`DESC/aniso3d_throat_iso/descriptors.csv` (2816 x 300, trained 2026-09-18 —
+see 12.9), `DESC/aniso3d_ph_fixed/descriptors.csv` (2816 x 5787);
 `RESULTS/aniso3d_throat/{k_xy,k_xz,k_yz,K_xx,K_yy,K_zz}/`,
 `RESULTS/aniso3d_conefixed/` likewise; logs `THROAT3D_DESC.log`,
 `RUN3D_ALL.log`, `RUN3D_ALL2.log`.
@@ -2932,3 +2932,145 @@ successful `wc`, and `set -e` kills the script **with no message**, ls's stderr
 having gone to /dev/null.  That is how stage 2 died silently on 2026-09-18.
 All three resume checks now use an explicit `[ -d ... ]` guard.  If you add
 `pipefail` to any other driver, audit its count pipelines first.
+
+### 12.9 The isotropic control — the directional walk is load-bearing (2026-09-18)
+
+`DESC/aniso3d_throat_iso/` is the throat filtration with the directional
+min-walk removed: the plain Euclidean distance transform, one 300-feature
+persistence image instead of nine.  Everything else — imaging parameters,
+collector, folds, seed — is identical to `thr`, so the pair isolates the walk
+and nothing else.
+
+    group   n_feat   k_xy R^2            n      recorded in
+    thr       2700   0.8081 +- 0.0288    2816   RESULTS/aniso3d_throat/k_xy
+    thr(iso)   300  -0.1225 +- 0.0434    2816   RESULTS/aniso3d_throat_iso/k_xy
+    porosity     1  -0.1117 +- 0.0242    2816   RESULTS/aniso3d/catboost/k_xy
+
+The isotropic variant lands at **-0.1225, below the porosity null**, and the
+2D counterpart scored -.086 (§11.12) — the same answer in both dimensions.
+This is the control the throat claim needed.  A non-directional scalar summary
+of pore size cannot predict an off-diagonal component, because k_xy changes
+sign under a reflection that leaves the distance transform invariant; the only
+way to get a signed quantity out is to build the descriptor around directions.
+So the +0.043 that `thr` takes over `baselines` on k_xy is not "PH on a better
+filtration function" alone — it is **the directional walk applied to** that
+filtration function.  Note the argument is symmetry, not fit quality: a
+below-null score is exactly what an invariant feature set should produce on a
+sign-changing target, and reading it as "the iso descriptor is weak" misses
+that it is *forbidden*, not merely poor.
+
+This does not transfer to the diagonals, which are sign-invariant, and the iso
+control was not run on them; if a diagonal number is ever wanted, it must be
+run, not inferred from this.
+
+### 12.10 The full dataset, n=5000 — single-target pass and porosity bands (2026-09-23)
+
+Every §12.3 number was at n=2816 and those RESULTS dirs were deleted (R^2
+moves with n). The n=5000 replacements, all in `RESULTS/aniso3d_all/`,
+5 folds, seed 0, 1500 iterations. **Single-target** (one fit per component;
+the pass that is like-for-like with the CNN — same KFold, same folds):
+
+    group           feat    K_xx    K_yy    K_zz    k_xy    k_xz    k_yz
+    por              720   .7811   .7823   .7852   .0520   .0381   .0442
+    tpc              369   .9702   .9717   .9697   .7851   .7824   .7742
+    fab               10  -.0660  -.0781  -.0810   .4962   .4784   .5001
+    fabdir           720   .4681   .4649   .4662   .5642   .5591   .5669
+    baselines       1819   .9677   .9695   .9692   .8070   .7989   .8003
+    tda             5787   .9696   .9712   .9703   .7783   .7781   .8003
+    thr             2700   .9882   .9875   .9886   .8468   .8230   .8513
+    all             7606   .9827   .9826   .9831   .8255   .8255   .8361
+    baselines+thr   4519   .9916   .9916   .9917   .8594   .8441   .8580
+    cnn3d densenet121      .9959   .9960   .9953   .9681   .9563   .9684
+
+Same ranking as the joint pass (RESUME §0 has that table); single-target is
+.02-.05 higher on the off-diagonals. `thr` > `baselines` on all six,
+`baselines+thr` best of the descriptors, CNN still well ahead off-diagonal.
+
+**Porosity bands** (`RESULTS/aniso3d_por/`, `run_3d_porosity.sh`, k_xy,
+n=1250/band, 5-fold): thr − baselines = −.002 (q1, por .650-.713), +.033
+(q2), +.009 (q3), +.021 (q4, .838-.900); fold sd of each difference .02-.03.
+**No porosity dependence** — as in 2D. But the dataset spans only .65-.90
+porosity, where the pore phase is presumably always well connected, so this
+does NOT test behaviour near the percolation threshold; that needs new
+low-porosity structures (not generated, by the user's choice).
+
+### 12.11 The 3D sample-size study — k_xy (2026-09-23)
+
+`run_lc3d.sh` -> `scripts/learning_curve.py`, tables by `scripts/lc_table.py`
+into `RESULTS/lc3d_kxy/table.md` (+ `table.csv`, every run).
+
+Design: frozen hold-out `splits/aniso3d_golden.{csv,json}` — 999 structures,
+333/stratum, seed 12345, sha256 2609c9ef…, verified on every load — scored
+identically by every (group, size, seed); training subsets from the other
+4001, nested and stratum-balanced; sizes 125-4000; 5 seeds; two arms, `es`
+(early stopping on 20% of the TRAINING subset, so n=4000 fits on 3200) and
+`fixed` (1500 iterations). 540 fits, 8.4 h on 52 cores.
+
+Check: `fixed` at n=4000 reproduces the §12.10 5-fold CV to within the
+hold-out's sampling noise (baselines .8066 vs .8070, tpc .7867 vs .7851,
+thr .8381 vs .8468, all .8426 vs .8255; no systematic sign).
+
+Paired ΔR^2 vs `baselines`, `fixed` arm (mean over seeds, seeds won of 5):
+
+    n             125        250        500        1000       2000       4000
+    baselines R2  .474       .552       .631       .705       .763       .807
+    thr          +.082 5/5  +.084 5/5  +.080 5/5  +.063 5/5  +.042 5/5  +.032 5/5
+    tda          -.017 2/5  +.025 4/5  +.026 5/5  +.024 5/5  -.006 2/5  -.014 0/5
+    bas+tda(all) +.046 5/5  +.082 5/5  +.077 5/5  +.066 5/5  +.041 5/5  +.036 5/5
+    bas+thr      +.089 5/5  +.096 5/5  +.089 5/5  +.073 5/5  +.054 5/5  +.046 5/5
+    tpc          -.197 0/5  -.108 0/5  -.030 0/5  -.003 2/5  -.015 0/5  -.020 0/5
+
+Findings:
+
+* **`thr` beats `baselines` at every size, 30/30 (size, seed) cells in each arm, and
+  the margin is largest at small n** (+.08 up to n=500, +.03 at 4000). In
+  structures: `thr` reaches baselines' n=4000 R^2 at ~2100 (fixed) / ~2400
+  (es) — about half the data. `baselines+thr` needs ~1700-2100.
+* **The cone `tda` crosses over**: ahead of `baselines` at n=250-1000 (5/5 at
+  500 in both arms), behind at 2000-4000 (0/5 at 4000). More data-efficient,
+  lower ceiling. Its complementarity is size-independent: `baselines+tda`
+  beats `baselines` at every size.
+* **The two arms agree** on every sign and on the ranking, so none of this is a
+  capacity artefact of the 800x dimension spread. `fixed` is higher than `es`
+  nearly everywhere — early stopping costs its 20% validation carve-out more
+  than it saves in overfitting. Read `fixed` as the headline.
+* `tpc` is the slowest learner (.28 at n=125, -.20 vs baselines), which is why
+  the `baselines` union beats it clearly at small n but only by .02 at 4000;
+  `fab`/`fabdir` saturate by n~1000 at ~.50.
+* No curve has saturated at 4000 (baselines +.044 from 2000 to 4000), so the
+  full-dataset margins in §12.10 are not asymptotic.
+
+### 12.12 The 3D sample-size study — k_xz (2026-09-29)
+
+`TARGET=k_xz OUT=RESULTS/lc3d_kxz bash run_lc3d.sh` (23:20 -> 07:28, 540/540
+fits), same frozen hold-out, sizes, seeds and arms as §12.11. Tables
+`RESULTS/lc3d_kxz/table.md`.
+
+Check: `fixed` at n=4000 sits ~.02-.035 ABOVE the §12.10 5-fold CV for every
+group (baselines .825 vs .799, tpc .800 vs .782, thr .853 vs .823, all .859 vs
+.826). Common to all groups, so it is the hold-out's own draw (easier on k_xz
+than the average fold), not a leak; the paired Δ cancels it (thr − baselines
++.028 here vs +.024 in CV). On k_xy there was no such offset.
+
+Paired ΔR^2 vs `baselines`, `fixed` arm (mean over seeds, seeds won of 5):
+
+    n             125        250        500        1000       2000       4000
+    baselines R2  .477       .557       .658       .722       .787       .825
+    thr          +.088 5/5  +.109 5/5  +.068 5/5  +.044 5/5  +.034 5/5  +.028 5/5
+    tda          -.027 2/5  +.054 5/5  +.046 5/5  +.033 5/5  +.004 3/5  -.012 0/5
+    bas+tda(all) +.056 5/5  +.109 5/5  +.090 5/5  +.072 5/5  +.046 5/5  +.034 5/5
+    bas+thr      +.100 5/5  +.117 5/5  +.085 5/5  +.065 5/5  +.044 5/5  +.047 5/5
+    tpc          -.188 0/5  -.091 0/5  -.021 1/5  -.009 2/5  -.012 0/5  -.025 0/5
+
+Findings — k_xz replicates k_xy on every qualitative point:
+
+* `thr` beats `baselines` at every size, 30/30 cells in each arm; margin peaks
+  at n=250 (+.11) and falls to +.03 at 4000. Matches baselines@4000 with
+  ~2200 (fixed) / ~2450 (es) structures.
+* Cone `tda` crosses over again: wins 250-1000 (5/5), coin-flip at 2000,
+  0/5 at 4000 in both arms. Its complementarity is again size-independent.
+* Difference from k_xy: `baselines+tda` is as good as or better than
+  `baselines+thr` at n=250-2000 (and reaches baselines@4000 with ~1730 vs
+  ~1830); `baselines+thr` pulls ahead only at 4000. Small-n, the cone adds as
+  much as the throat on k_xz.
+* Arms agree on every sign; `fixed` > `es` again. No curve saturated.
